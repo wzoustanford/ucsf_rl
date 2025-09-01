@@ -1,0 +1,63 @@
+\documentclass{article}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage[table]{xcolor}
+
+\begin{document}
+
+\begin{table}[h]
+\centering
+\caption{KDE Off-Policy Evaluation Results for Binary CQL Models}
+\label{tab:kde_ope_results}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Metric} & \textbf{$\alpha=0.00$} & \textbf{$\alpha=0.001$} & \textbf{$\alpha=0.01$} \\
+\midrule
+\multicolumn{4}{l}{\textit{Vasopressor Usage Policy}} \\
+Standard Policy P(a=1) & 28.1\% & 32.6\% & 28.1\% \\
+Initiation Policy P(a=1) & 69.1\% & 74.6\% & 59.7\% \\
+Patients Initiated VP & 77.3\% & 79.7\% & 66.2\% \\
+\midrule
+\multicolumn{4}{l}{\textit{Off-Policy Evaluation}} \\
+Behavioral Reward & 0.0598 & 0.0598 & 0.0598 \\
+IS Estimate & 0.2912 & 0.3797 & 0.3724 \\
+IS 95\% CI & [0.162, 0.440] & [0.231, 0.521] & [0.231, 0.474] \\
+WIS Estimate & 0.0579 & 0.0738 & 0.0711 \\
+WIS 95\% CI & [0.032, 0.087] & [0.045, 0.102] & [0.044, 0.091] \\
+\midrule
+\multicolumn{4}{l}{\textit{Importance Weights}} \\
+Mean Weight & 5.034 & 5.144 & 5.238 \\
+Std Weight & 7.948 & 8.006 & 8.066 \\
+Max Weight & 20.0 & 20.0 & 20.0 \\
+ESS & 8,959 & 9,143 & 9,283 \\
+ESS Ratio & 28.6\% & 29.2\% & 29.7\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\bigskip
+
+\textbf{Notes:}
+\begin{itemize}
+\item \textbf{Initiation Policy}: Once vasopressor is initiated, it cannot be discontinued (clinically realistic constraint)
+\item \textbf{ESS (Effective Sample Size)}: $\text{ESS} = \frac{(\sum w_i)^2}{\sum w_i^2}$, measures the effective number of samples after importance weighting
+\item \textbf{ESS Ratio}: ESS divided by total test samples (31,289), indicates the fraction of ``useful'' samples
+\item \textbf{IS}: Importance Sampling estimate of expected reward
+\item \textbf{WIS}: Weighted Importance Sampling (more stable, preferred estimator)
+\item All evaluations use test set with random seed 42 for consistency
+\end{itemize}
+
+\bigskip
+
+\textbf{Key Findings:}
+\begin{enumerate}
+\item \textbf{Optimal CQL penalty}: $\alpha=0.001$ achieves highest WIS estimate (0.0738) compared to behavioral (0.0598), suggesting 23\% improvement
+\item \textbf{Conservative behavior}: All models use vasopressor less frequently than clinicians in standard policy
+\item \textbf{Initiation effect}: VP usage increases dramatically with initiation constraint (e.g., 32.6\% $\rightarrow$ 74.6\% for $\alpha=0.001$)
+\item \textbf{Over-conservatism}: $\alpha=0.01$ becomes too conservative, initiating VP in only 66.2\% of patients
+\item \textbf{ESS stability}: All models maintain reasonable ESS ($\approx$29\%), indicating acceptable policy overlap for reliable OPE
+\end{enumerate}
+
+\end{document}

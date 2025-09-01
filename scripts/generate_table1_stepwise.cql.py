@@ -105,7 +105,8 @@ class StepwiseVasopressorPolicy:
             # For simplicity, use no-change action for VP2
             vp1_binary = int(action[0] > 0.5)
             vp2_change_idx = len(self.action_space.VP2_CHANGES) // 2  # Middle index = no change
-            discrete_action = self.action_space.get_discrete_action(vp1_binary, vp2_change_idx)
+            discrete_action = vp1_binary * self.action_space.n_vp2_actions + vp2_change_idx  # Shape: (batch_size,)
+            #discrete_action = self.action_space.get_discrete_action(vp1_binary, vp2_change_idx)
             action_tensor = torch.LongTensor([discrete_action]).to(self.agent.device)
             
             q1 = self.agent.q1(state_tensor, action_tensor).item()
@@ -173,7 +174,7 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
             policy = None
     elif model_type == 'stepwise':
         # Stepwise CQL model
-        model_path = f'experiment/stepwise_cql_alpha{alpha:.4f}_best.pt'
+        model_path = f'experiment/stepwise_cql_alpha{alpha:.6f}_maxstep{max_step:.1f}_best.pt'
         
         checkpoint = torch.load(model_path, map_location='cuda')
         
@@ -230,6 +231,8 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
     q_values_patient = []
     vp1_concordances = []
     vp2_concordances = []  # For block discrete models only
+    delta_q_timestep = []  # Delta Q per timestep
+    delta_q_patient = []  # Delta Q per patient
     
     # Process each patient
     for patient_id, (start_idx, end_idx) in patient_groups.items():
@@ -237,6 +240,7 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
         patient_actions = test_data['actions'][start_idx:end_idx]
         
         patient_q_values = []
+        patient_delta_q = []  # Track delta Q for this patient
         patient_vp1_concordance = []
         patient_vp2_concordance = []  # For block discrete only
         vp1_used = False
@@ -254,16 +258,30 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
                     model_action = policy.select_action(state, patient_id, epsilon=0.0)
                     q0, q1 = policy.get_q_values(state)
                     q_val = max(q0, q1)
+                    # Get Q-value for clinician action
+                    q_clinician = q0 if clinician_action == 0 else q1
                 else:
                     model_action_arr = agent.select_action(state, epsilon=0.0)
                     model_action = int(model_action_arr[0])
                     
                     with torch.no_grad():
                         state_t = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
+                        # Q-value for model's optimal action
                         action_t = torch.FloatTensor([model_action]).unsqueeze(0).to(agent.device)
                         q1 = agent.q1(state_t, action_t).item()
                         q2 = agent.q2(state_t, action_t).item()
                         q_val = min(q1, q2)
+                        
+                        # Q-value for clinician's action
+                        clinician_action_t = torch.FloatTensor([clinician_action]).unsqueeze(0).to(agent.device)
+                        q1_clin = agent.q1(state_t, clinician_action_t).item()
+                        q2_clin = agent.q2(state_t, clinician_action_t).item()
+                        q_clinician = min(q1_clin, q2_clin)
+                
+                # Calculate delta Q (model optimal - clinician)
+                delta_q = q_val - q_clinician
+                patient_delta_q.append(delta_q)
+                delta_q_timestep.append(delta_q)
                 
                 if model_action > 0:
                     vp1_used = True
@@ -274,6 +292,8 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
                     # Use policy wrapper with persistence
                     model_action = policy.select_action(state, patient_id)
                     q_val = policy.get_q_value(state, model_action)
+                    # Get Q-value for clinician action
+                    q_clinician = policy.get_q_value(state, clinician_action)
                 else:
                     # Use agent directly (only for non-stepwise)
                     if model_type == 'stepwise':
@@ -286,20 +306,39 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
                         # For block discrete, need to get Q-value differently
                         with torch.no_grad():
                             state_t = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
-                            # Convert continuous action to discrete index for Q-value computation
+                            # Q-value for model's optimal action
                             action_idx = agent.continuous_to_discrete_action(model_action)
                             action_idx_t = torch.LongTensor([action_idx]).to(agent.device)
                             q1 = agent.q1(state_t, action_idx_t).item()
                             q2 = agent.q2(state_t, action_idx_t).item()
                             q_val = min(q1, q2)
+                            
+                            # Q-value for clinician's action
+                            clinician_idx = agent.continuous_to_discrete_action(clinician_action)
+                            clinician_idx_t = torch.LongTensor([clinician_idx]).to(agent.device)
+                            q1_clin = agent.q1(state_t, clinician_idx_t).item()
+                            q2_clin = agent.q2(state_t, clinician_idx_t).item()
+                            q_clinician = min(q1_clin, q2_clin)
                     else:
                         # Dual mixed model
                         with torch.no_grad():
                             state_t = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
+                            # Q-value for model's optimal action
                             action_t = torch.FloatTensor(model_action).unsqueeze(0).to(agent.device)
                             q1 = agent.q1(state_t, action_t).item()
                             q2 = agent.q2(state_t, action_t).item()
                             q_val = min(q1, q2)
+                            
+                            # Q-value for clinician's action
+                            clinician_action_t = torch.FloatTensor(clinician_action).unsqueeze(0).to(agent.device)
+                            q1_clin = agent.q1(state_t, clinician_action_t).item()
+                            q2_clin = agent.q2(state_t, clinician_action_t).item()
+                            q_clinician = min(q1_clin, q2_clin)
+                
+                # Calculate delta Q
+                delta_q = q_val - q_clinician
+                patient_delta_q.append(delta_q)
+                delta_q_timestep.append(delta_q)
                 
                 # VP1 is binary (0 or 1), VP2 is continuous [0, 0.5]
                 if model_action[0] > 0:  # VP1 is binary
@@ -345,6 +384,7 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
         if model_type in ['dual', 'block_discrete', 'stepwise']:
             vp2_usage.append(vp2_used)
         q_values_patient.append(np.mean(patient_q_values))
+        delta_q_patient.append(np.mean(patient_delta_q))  # Add patient-level delta Q
         vp1_concordances.append(np.mean(patient_vp1_concordance))
         if model_type in ['block_discrete', 'stepwise'] and patient_vp2_concordance:
             vp2_concordances.append(np.mean(patient_vp2_concordance))
@@ -355,6 +395,8 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
         'vp2_usage': np.mean(vp2_usage) * 100 if vp2_usage else None,
         'q_per_timestep': np.mean(q_values_timestep),
         'q_per_patient': np.mean(q_values_patient),
+        'delta_q_per_timestep': np.mean(delta_q_timestep),  # Average delta Q per timestep
+        'delta_q_per_patient': np.mean(delta_q_patient),  # Average delta Q per patient
         'vp1_concordance': np.mean(vp1_concordances) * 100,
         'vp2_concordance': np.mean(vp2_concordances) * 100 if vp2_concordances else None
     }
@@ -362,7 +404,7 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
     return results
 
 
-def generate_latex_table():
+def generate_latex_table(max_step):
     """Generate LaTeX table comparing Clinician, Binary CQL, and Stepwise CQL models"""
     
     print("="*70)
@@ -376,12 +418,18 @@ def generate_latex_table():
     print(f"\nEvaluating Binary CQL (alpha=0.001)...")
     results['binary'] = evaluate_model('binary', alpha=0.001, apply_persistence=True)
     
-    # Stepwise CQL models
-    print(f"\nEvaluating Stepwise CQL (alpha=0.0000)...")
-    results['stepwise_0.0000'] = evaluate_model('stepwise', alpha=0.0000, apply_persistence=True, max_step=0.1)
+    # Stepwise CQL models - including all requested alphas
+    print(f"\nEvaluating Stepwise CQL (alpha=0.000000)...")
+    results['stepwise_0.000000'] = evaluate_model('stepwise', alpha=0.000000, apply_persistence=True, max_step=max_step)
     
-    print(f"\nEvaluating Stepwise CQL (alpha=0.0001)...")
-    results['stepwise_0.0001'] = evaluate_model('stepwise', alpha=0.0001, apply_persistence=True, max_step=0.1)
+    print(f"\nEvaluating Stepwise CQL (alpha=0.000100)...")
+    results['stepwise_0.000100'] = evaluate_model('stepwise', alpha=0.000100, apply_persistence=True, max_step=max_step)
+    
+    print(f"\nEvaluating Stepwise CQL (alpha=0.001000)...")
+    results['stepwise_0.001000'] = evaluate_model('stepwise', alpha=0.001000, apply_persistence=True, max_step=max_step)
+    
+    print(f"\nEvaluating Stepwise CQL (alpha=0.010000)...")
+    results['stepwise_0.010000'] = evaluate_model('stepwise', alpha=0.010000, apply_persistence=True, max_step=max_step)
     
     # Helper function to format values
     def fmt(val, fmt_str=".1f"):
@@ -397,26 +445,30 @@ def generate_latex_table():
 \centering
 \caption{Comparison of Binary CQL and Stepwise CQL models with vasopressor persistence policy}
 \label{tab:stepwise_comparison}
-\begin{tabular}{lcccccc}
+\begin{tabular}{lccccccc}
 \toprule
-Model & $\alpha$ & VP1 (\%) & VP2 (\%) & Q/time & VP1 Conc. (\%) & VP2 Conc. (\%) \\
+Model & $\alpha$ & VP1 (\%) & VP2 (\%) & Q/time & $\Delta$Q & VP1 C. (\%) & VP2 C. (\%) \\
 \midrule
-Clinician & -- & 38.8 & 99.8 & 0.000 & 100.0 & -- \\
+Clinician & -- & 38.8 & 99.8 & 0.000 & 0.000 & 100.0 & -- \\
 \midrule"""
     
     # Add model results
     b_res = results['binary']
-    s0_res = results['stepwise_0.0000']
-    s1_res = results['stepwise_0.0001']
+    s0_res = results['stepwise_0.000000']
+    s1_res = results['stepwise_0.000100']
+    s2_res = results['stepwise_0.001000']
+    s3_res = results['stepwise_0.010000']
     
     # Binary CQL
     latex += f"""
-Binary CQL & 0.001 & {fmt(b_res.get('vp1_usage'))} & -- & {fmt(b_res.get('q_per_timestep'), '.3f')} & {fmt(b_res.get('vp1_concordance'))} & -- \\\\"""
+Binary CQL & 0.001 & {fmt(b_res.get('vp1_usage'))} & -- & {fmt(b_res.get('q_per_timestep'), '.3f')} & {fmt(b_res.get('delta_q_per_timestep'), '.3f')} & {fmt(b_res.get('vp1_concordance'))} & -- \\\\"""
     
     # Stepwise CQL models
     latex += f"""
-Stepwise CQL & 0.0000 & {fmt(s0_res.get('vp1_usage'))} & {fmt(s0_res.get('vp2_usage'))} & {fmt(s0_res.get('q_per_timestep'), '.3f')} & {fmt(s0_res.get('vp1_concordance'))} & {fmt(s0_res.get('vp2_concordance'))} \\\\
-Stepwise CQL & 0.0001 & {fmt(s1_res.get('vp1_usage'))} & {fmt(s1_res.get('vp2_usage'))} & {fmt(s1_res.get('q_per_timestep'), '.3f')} & {fmt(s1_res.get('vp1_concordance'))} & {fmt(s1_res.get('vp2_concordance'))} \\\\"""
+Stepwise CQL & 0.000000 & {fmt(s0_res.get('vp1_usage'))} & {fmt(s0_res.get('vp2_usage'))} & {fmt(s0_res.get('q_per_timestep'), '.3f')} & {fmt(s0_res.get('delta_q_per_timestep'), '.3f')} & {fmt(s0_res.get('vp1_concordance'))} & {fmt(s0_res.get('vp2_concordance'))} \\\\
+Stepwise CQL & 0.000100 & {fmt(s1_res.get('vp1_usage'))} & {fmt(s1_res.get('vp2_usage'))} & {fmt(s1_res.get('q_per_timestep'), '.3f')} & {fmt(s1_res.get('delta_q_per_timestep'), '.3f')} & {fmt(s1_res.get('vp1_concordance'))} & {fmt(s1_res.get('vp2_concordance'))} \\\\
+Stepwise CQL & 0.001000 & {fmt(s2_res.get('vp1_usage'))} & {fmt(s2_res.get('vp2_usage'))} & {fmt(s2_res.get('q_per_timestep'), '.3f')} & {fmt(s2_res.get('delta_q_per_timestep'), '.3f')} & {fmt(s2_res.get('vp1_concordance'))} & {fmt(s2_res.get('vp2_concordance'))} \\\\
+Stepwise CQL & 0.010000 & {fmt(s3_res.get('vp1_usage'))} & {fmt(s3_res.get('vp2_usage'))} & {fmt(s3_res.get('q_per_timestep'), '.3f')} & {fmt(s3_res.get('delta_q_per_timestep'), '.3f')} & {fmt(s3_res.get('vp1_concordance'))} & {fmt(s3_res.get('vp2_concordance'))} \\\\"""
     
     latex += r"""
 \bottomrule
@@ -424,24 +476,27 @@ Stepwise CQL & 0.0001 & {fmt(s1_res.get('vp1_usage'))} & {fmt(s1_res.get('vp2_us
 \end{table}"""
     
     # Save to file
-    with open('stepwise_comparison_table.tex', 'w') as f:
+    with open(f'stepwise_v2_deltaq_max_step{max_step:.1f}_comparison_table.tex', 'w') as f:
         f.write(latex)
     
-    print("\n✓ LaTeX table saved to: stepwise_comparison_table.tex")
+    print(f"\n✓ LaTeX table saved to: stepwise_v2_deltaq_max_step{max_step:.1f}_comparison_table.tex")
     
     # Also print results
     print("\nNumerical Results:")
     print("-"*80)
-    print(f"{'Model':<20} {'Alpha':<8} {'VP1 (%)':<10} {'VP2 (%)':<10} {'Q/time':<10} {'VP1-C (%)':<10} {'VP2-C (%)':<10}")
-    print("-"*80)
-    print(f"{'Clinician':<20} {'--':<8} {'38.8':<10} {'99.8':<10} {'0.000':<10} {'100.0':<10} {'--':<10}")
-    print(f"{'Binary CQL':<20} {'0.001':<8} {fmt(b_res.get('vp1_usage')):<10} {'--':<10} {fmt(b_res.get('q_per_timestep'), '.3f'):<10} {fmt(b_res.get('vp1_concordance')):<10} {'--':<10}")
-    print(f"{'Stepwise CQL':<20} {'0.0000':<8} {fmt(s0_res.get('vp1_usage')):<10} {fmt(s0_res.get('vp2_usage')):<10} {fmt(s0_res.get('q_per_timestep'), '.3f'):<10} {fmt(s0_res.get('vp1_concordance')):<10} {fmt(s0_res.get('vp2_concordance')):<10}")
-    print(f"{'Stepwise CQL':<20} {'0.0001':<8} {fmt(s1_res.get('vp1_usage')):<10} {fmt(s1_res.get('vp2_usage')):<10} {fmt(s1_res.get('q_per_timestep'), '.3f'):<10} {fmt(s1_res.get('vp1_concordance')):<10} {fmt(s1_res.get('vp2_concordance')):<10}")
+    print(f"{'Model':<20} {'Alpha':<8} {'VP1 (%)':<10} {'VP2 (%)':<10} {'Q/time':<10} {'ΔQ':<10} {'VP1-C (%)':<10} {'VP2-C (%)':<10}")
+    print("-"*90)
+    print(f"{'Clinician':<20} {'--':<8} {'38.8':<10} {'99.8':<10} {'0.000':<10} {'0.000':<10} {'100.0':<10} {'--':<10}")
+    print(f"{'Binary CQL':<20} {'0.001':<8} {fmt(b_res.get('vp1_usage')):<10} {'--':<10} {fmt(b_res.get('q_per_timestep'), '.3f'):<10} {fmt(b_res.get('delta_q_per_timestep'), '.3f'):<10} {fmt(b_res.get('vp1_concordance')):<10} {'--':<10}")
+    print(f"{'Stepwise CQL':<20} {'0.000000':<8} {fmt(s0_res.get('vp1_usage')):<10} {fmt(s0_res.get('vp2_usage')):<10} {fmt(s0_res.get('q_per_timestep'), '.3f'):<10} {fmt(s0_res.get('delta_q_per_timestep'), '.3f'):<10} {fmt(s0_res.get('vp1_concordance')):<10} {fmt(s0_res.get('vp2_concordance')):<10}")
+    print(f"{'Stepwise CQL':<20} {'0.000100':<8} {fmt(s1_res.get('vp1_usage')):<10} {fmt(s1_res.get('vp2_usage')):<10} {fmt(s1_res.get('q_per_timestep'), '.3f'):<10} {fmt(s1_res.get('delta_q_per_timestep'), '.3f'):<10} {fmt(s1_res.get('vp1_concordance')):<10} {fmt(s1_res.get('vp2_concordance')):<10}")
+    print(f"{'Stepwise CQL':<20} {'0.001000':<8} {fmt(s2_res.get('vp1_usage')):<10} {fmt(s2_res.get('vp2_usage')):<10} {fmt(s2_res.get('q_per_timestep'), '.3f'):<10} {fmt(s2_res.get('delta_q_per_timestep'), '.3f'):<10} {fmt(s2_res.get('vp1_concordance')):<10} {fmt(s2_res.get('vp2_concordance')):<10}")
+    print(f"{'Stepwise CQL':<20} {'0.010000':<8} {fmt(s3_res.get('vp1_usage')):<10} {fmt(s3_res.get('vp2_usage')):<10} {fmt(s3_res.get('q_per_timestep'), '.3f'):<10} {fmt(s3_res.get('delta_q_per_timestep'), '.3f'):<10} {fmt(s3_res.get('vp1_concordance')):<10} {fmt(s3_res.get('vp2_concordance')):<10}")
     
     return results
 
 
 if __name__ == "__main__":
-    results = generate_latex_table()
+    max_step = 0.2
+    results = generate_latex_table(max_step)
     print("\n✅ Stepwise CQL comparison complete!")

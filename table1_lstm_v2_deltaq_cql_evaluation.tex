@@ -1,0 +1,23 @@
+\begin{table}[ht]
+\centering
+\caption{Evaluation of LSTM Block Discrete CQL models with different conservatism levels ($\alpha$) and bin configurations.}
+\label{tab:lstm_cql_evaluation}
+\begin{tabular}{lcccccc}
+\toprule
+Model & $\alpha$ & Bins & VP2 Usage (\%) & Q/time & $\Delta$Q & VP2 Conc. (\%) \\
+\midrule
+LSTM Block Discrete & 0.0 & 3 & 100.0 & 0.225 & 0.082 & 59.4 \\
+LSTM Block Discrete & 0.0 & 5 & 100.0 & 0.134 & 0.070 & 41.2 \\
+LSTM Block Discrete & 0.0 & 10 & 100.0 & 0.237 & 0.132 & 23.0 \\
+LSTM Block Discrete & 1.0e-06 & 3 & 100.0 & -0.009 & 0.091 & 58.6 \\
+LSTM Block Discrete & 1.0e-06 & 5 & 100.0 & 0.095 & 0.079 & 40.7 \\
+LSTM Block Discrete & 1.0e-06 & 10 & 100.0 & 0.312 & 0.125 & 26.4 \\
+LSTM Block Discrete & 1.0e-05 & 3 & 100.0 & 0.198 & 0.075 & 59.0 \\
+LSTM Block Discrete & 1.0e-05 & 5 & 100.0 & 0.089 & 0.074 & 42.3 \\
+LSTM Block Discrete & 1.0e-05 & 10 & 100.0 & 0.217 & 0.127 & 8.3 \\
+LSTM Block Discrete & 0.0001 & 3 & 100.0 & 0.194 & 0.079 & 60.1 \\
+LSTM Block Discrete & 0.0001 & 5 & 100.0 & 0.087 & 0.070 & 41.9 \\
+LSTM Block Discrete & 0.0001 & 10 & 100.0 & 0.293 & 0.191 & 16.0 \\
+\bottomrule
+\end{tabular}
+\end{table}

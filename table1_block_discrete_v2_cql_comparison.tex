@@ -1,0 +1,30 @@
+\begin{table}[ht]
+\centering
+\caption{Comprehensive comparison of CQL models including Binary, Dual Mixed, and Block Discrete (with 3, 5, 10 bins) variants across different conservatism levels ($\alpha$).}
+\label{tab:cql_comparison}
+\begin{tabular}{llccccccc}
+\toprule
+Model & Config & $\alpha$ & VP1 (\%) & VP2 (\%) & Q/time & $\Delta$Q & VP1 C. (\%) & VP2 C. (\%) \\
+\midrule
+Clinician & -- & -- & 38.8 & 99.8 & 0.000 & 0.000 & 100.0 & -- \\
+\midrule
+Binary CQL & -- & 0.000 & 77.3 & -- & 0.792 & 0.023 & 51.6 & -- \\
+Dual Mixed & -- & 0.000 & 87.7 & 100.0 & 1.367 & 0.177 & 41.2 & -- \\
+Block Discrete & 3 bins & 0.000 & 71.4 & 100.0 & 1.734 & 0.123 & 55.2 & 57.1 \\
+Block Discrete & 5 bins & 0.000 & 96.3 & 100.0 & 2.383 & 0.265 & 39.7 & 26.4 \\
+Block Discrete & 10 bins & 0.000 & 92.3 & 100.0 & 4.673 & 0.309 & 42.4 & 13.3 \\
+\midrule
+Binary CQL & -- & 0.001 & 79.8 & -- & 0.869 & 0.028 & 44.5 & -- \\
+Dual Mixed & -- & 0.001 & 69.4 & 99.7 & 1.302 & 0.184 & 56.6 & -- \\
+Block Discrete & 3 bins & 0.001 & 82.2 & 100.0 & 1.614 & 0.110 & 46.9 & 55.5 \\
+Block Discrete & 5 bins & 0.001 & 93.6 & 100.0 & 2.281 & 0.217 & 41.3 & 27.2 \\
+Block Discrete & 10 bins & 0.001 & 96.6 & 100.0 & 4.445 & 0.292 & 39.1 & 14.1 \\
+\midrule
+Binary CQL & -- & 0.010 & 66.2 & -- & 0.774 & 0.024 & 58.7 & -- \\
+Dual Mixed & -- & 0.010 & 77.8 & 99.8 & 1.345 & 0.185 & 52.5 & -- \\
+Block Discrete & 3 bins & 0.010 & 76.8 & 100.0 & 1.576 & 0.127 & 53.1 & 56.3 \\
+Block Discrete & 5 bins & 0.010 & 84.9 & 100.0 & 2.091 & 0.119 & 43.9 & 40.3 \\
+Block Discrete & 10 bins & 0.010 & 92.8 & 100.0 & 4.072 & 0.245 & 41.4 & 16.6 \\
+\bottomrule
+\end{tabular}
+\end{table}

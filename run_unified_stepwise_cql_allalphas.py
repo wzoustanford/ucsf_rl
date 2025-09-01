@@ -84,10 +84,6 @@ class StepwiseActionSpace:
             _, vp2_change_idx = self.decode_action(action_idx)
             self.vp2_changes_per_action[action_idx] = self.VP2_CHANGES[vp2_change_idx]
     
-    def get_discrete_action(self, vp1: int, vp2_change_idx: int) -> int:
-        """Get discrete action index from VP1 and VP2 change index"""
-        return vp1 * self.n_vp2_actions + vp2_change_idx
-    
     def decode_action(self, action_idx: int) -> tuple:
         """Decode discrete action to VP1 and VP2 change index"""
         return self.action_map[action_idx]
@@ -465,83 +461,55 @@ class UnifiedStepwiseCQL:
 
 def prepare_stepwise_batch(batch, action_space, device):
     """
-    Convert batch from pipeline to stepwise format with VP2 one-hot encoding
+    Prepare batch from get_stepwise_batch for training.
     
     Args:
-        batch: Batch from IntegratedDataPipelineV2 
+        batch: Batch from pipeline.get_stepwise_batch() with VP2 change info
         action_space: StepwiseActionSpace instance
         device: Device to place tensors on
     
     Returns:
         Dictionary with prepared batch data
     """
-    # Extract VP1 and VP2 from continuous actions
-    vp1_actions = batch['actions'][:, 0]  # First column is VP1
-    vp2_doses = batch['actions'][:, 1]     # Second column is VP2
+    batch_size = len(batch['states'])
     
-    # IMPORTANT: Clamp VP2 doses to valid range [0.05, 0.5]
-    # Raw data has ~10% of values > 0.5 (many at 21.0, likely errors)
-    # 90th percentile is ~0.5, so clamping preserves 90% of data unchanged
-    # VP2_MIN = 0.05 ensures VP2 is always > 0
-    vp2_doses = np.clip(vp2_doses, action_space.VP2_MIN, action_space.VP2_MAX)
+    # Create one-hot encodings for VP2 bins (vectorized)
+    vp2_current_one_hot = np.zeros((batch_size, action_space.n_vp2_bins))
+    vp2_current_one_hot[np.arange(batch_size), batch['vp2_current_bins']] = 1.0
     
-    batch_size = len(vp1_actions)
+    vp2_next_one_hot = np.zeros((batch_size, action_space.n_vp2_bins))
+    vp2_next_one_hot[np.arange(batch_size), batch['vp2_next_bins']] = 1.0
     
-    # Convert continuous VP2 to discrete bins and one-hot encode for state
-    vp2_one_hot = np.zeros((batch_size, action_space.n_vp2_bins))
-    discrete_actions = np.zeros(batch_size, dtype=np.int64)
+    # Augment states with VP2 one-hot encodings
+    extended_states = np.concatenate([batch['states'], vp2_current_one_hot], axis=1)
+    extended_next_states = np.concatenate([batch['next_states'], vp2_next_one_hot], axis=1)
     
-    for i in range(batch_size):
-        # Get current VP2 dose and convert to one-hot for state
-        current_vp2 = vp2_doses[i]
-        vp2_one_hot[i] = action_space.vp2_to_one_hot(current_vp2)
-        
-        # Determine discrete action taken
-        # For training data, we need to find the closest stepwise action
-        if i > 0 and batch['patient_ids'][i] == batch['patient_ids'][i-1]:
-            # Same patient, can compute actual change
-            prev_vp2 = vp2_doses[i-1]
-            vp2_change = current_vp2 - prev_vp2
-        else:
-            # New patient or first timestep, assume no change
-            vp2_change = 0.0
-        
-        # Find closest VP2 change action
-        vp2_change_idx = np.argmin(np.abs(action_space.VP2_CHANGES - vp2_change))
-        vp1_binary = int(vp1_actions[i] > 0.5)
-        discrete_actions[i] = action_space.get_discrete_action(vp1_binary, vp2_change_idx)
+    # Create binary VP1 array: 1 if VP1 > 0.5, 0 otherwise
+    vp1_binary = (batch['vp1_actions'] > 0.5).astype(np.int64)  # Shape: (batch_size,)
     
-    # Extend states with VP2 one-hot encoding
-    extended_states = np.concatenate([batch['states'], vp2_one_hot], axis=1)
+    # VP2 changes are discrete bin differences from get_stepwise_batch
+    # Map to action space VP2_CHANGES indices
+    # VP2_CHANGES goes from -max_step to +max_step (e.g., [-0.1, -0.05, 0, +0.05, +0.1])
+    # vp2_changes are in bins (e.g., -2, -1, 0, +1, +2)
+    # Since each bin = 0.05 and VP2_CHANGES are also in 0.05 increments, 
+    # we can directly map: bin_change -> index in VP2_CHANGES
+    middle_idx = len(action_space.VP2_CHANGES) // 2  # Index for 0 change
+    vp2_change_idx = np.clip(batch['vp2_changes'] + middle_idx, 
+                              0, len(action_space.VP2_CHANGES) - 1)  # Shape: (batch_size,)
     
-    # For next states, we need VP2 one-hot for the next timestep
-    next_vp2_one_hot = np.zeros((batch_size, action_space.n_vp2_bins))
-    next_vp2_doses = vp2_doses.copy()  # Simplified - in real data would track actual next doses
+    # Combine VP1 and VP2 into single discrete action array
+    # Formula: vp1 * n_vp2_actions + vp2_change_idx (vectorized)
+    discrete_actions = vp1_binary * action_space.n_vp2_actions + vp2_change_idx  # Shape: (batch_size,)
     
-    for i in range(batch_size):
-        # For terminal states or last in trajectory, use current VP2
-        if batch['dones'][i] > 0.5 or i == batch_size - 1:
-            next_vp2_doses[i] = vp2_doses[i]
-        elif batch['patient_ids'][i] != batch['patient_ids'][i+1]:
-            # Next sample is different patient
-            next_vp2_doses[i] = vp2_doses[i]
-        else:
-            # Next sample is same patient
-            next_vp2_doses[i] = vp2_doses[i+1] if i+1 < batch_size else vp2_doses[i]
-        
-        next_vp2_one_hot[i] = action_space.vp2_to_one_hot(next_vp2_doses[i])
-    
-    extended_next_states = np.concatenate([batch['next_states'], next_vp2_one_hot], axis=1)
-    
-    # Convert to tensors
+    # Convert to tensors (Q-network will handle one-hot conversion internally)
     return {
         'states': torch.FloatTensor(extended_states).to(device),
         'next_states': torch.FloatTensor(extended_next_states).to(device),
         'actions': torch.LongTensor(discrete_actions).to(device),
         'rewards': torch.FloatTensor(batch['rewards']).to(device),
         'dones': torch.FloatTensor(batch['dones']).to(device),
-        'current_vp2_doses': torch.FloatTensor(vp2_doses).to(device),
-        'next_vp2_doses': torch.FloatTensor(next_vp2_doses).to(device),
+        'current_vp2_doses': torch.FloatTensor(batch['vp2_current']).to(device),
+        'next_vp2_doses': torch.FloatTensor(batch['vp2_next']).to(device),
         'patient_ids': batch['patient_ids']
     }
 
@@ -592,7 +560,7 @@ def train_unified_stepwise_cql(alpha=0.001, max_step=0.1):
     )
     
     # Training loop
-    epochs = 200  # Reduced for testing
+    epochs = 100  # Reduced for testing
     batch_size = 128
     print(f"\nTraining for {epochs} epochs with batch size {batch_size}...", flush=True)
     start_time = time.time()
@@ -615,10 +583,11 @@ def train_unified_stepwise_cql(alpha=0.001, max_step=0.1):
         #min(1500, len(train_data['states']) // batch_size)  # Limit batches for testing
         
         for _ in range(n_batches):
-            # Get batch from pipeline
-            batch = pipeline.get_batch(batch_size=batch_size, split='train')
+            # Get batch from pipeline with VP2 change information
+            batch = pipeline.get_stepwise_batch(batch_size=batch_size, split='train', 
+                                                vp2_bins=action_space.n_vp2_bins)
             
-            # Convert to stepwise format
+            # Prepare batch for training (add one-hot encodings and convert to tensors)
             stepwise_batch = prepare_stepwise_batch(batch, action_space, agent.device)
             
             # Update agent
@@ -648,9 +617,10 @@ def train_unified_stepwise_cql(alpha=0.001, max_step=0.1):
         with torch.no_grad():
             # Sample validation batches
             for _ in range(5):  # Use 5 validation batches for testing
-                batch = pipeline.get_batch(batch_size=batch_size, split='val')
+                batch = pipeline.get_stepwise_batch(batch_size=batch_size, split='val',
+                                                    vp2_bins=action_space.n_vp2_bins)
                 
-                # Convert to stepwise format
+                # Prepare batch for training (add one-hot encodings and convert to tensors)
                 stepwise_batch = prepare_stepwise_batch(batch, action_space, agent.device)
                 
                 # Evaluate Q-values for taken actions
@@ -675,7 +645,7 @@ def train_unified_stepwise_cql(alpha=0.001, max_step=0.1):
                 'alpha': alpha,
                 'gamma': 0.95,
                 'tau': 0.8
-            }, f'experiment/stepwise_cql_alpha{alpha:.6f}_best.pt')
+            }, f'experiment/stepwise_cql_alpha{alpha:.6f}_maxstep{max_step:.1f}_best.pt')
         
         # Print progress
         if (epoch + 1) % 1 == 0:
@@ -697,42 +667,45 @@ def train_unified_stepwise_cql(alpha=0.001, max_step=0.1):
         'alpha': alpha,
         'gamma': 0.95,
         'tau': 0.8
-    }, f'experiment/stepwise_cql_alpha{alpha:.6f}_final.pt')
+    }, f'experiment/stepwise_cql_alpha{alpha:.6f}_maxstep{max_step:.1f}_final.pt')
     
     total_time = time.time() - start_time
     print(f"\n✅ Stepwise CQL (alpha={alpha}) training completed in {total_time/60:.1f} minutes!", flush=True)
     print("Models saved:", flush=True)
-    print(f"  - experiment/stepwise_cql_alpha{alpha:.6f}_best.pt", flush=True)
-    print(f"  - experiment/stepwise_cql_alpha{alpha:.6f}_final.pt", flush=True)
+    print(f"  - experiment/stepwise_cql_alpha{alpha:.6f}_maxstep{max_step:.1f}_best.pt", flush=True)
+    print(f"  - experiment/stepwise_cql_alpha{alpha:.6f}_maxstep{max_step:.1f}_final.pt", flush=True)
     
     return agent, pipeline
 
 
 def main():
-    """Train Stepwise CQL with multiple alpha values"""
-    print("="*70, flush=True)
-    print(" STEPWISE CQL TRAINING - ALL ALPHAS", flush=True)
-    print("="*70, flush=True)
-    print("\nThis script trains Stepwise CQL models with:", flush=True)
-    print("  - VP1: Binary (0 or 1)", flush=True)
-    print("  - VP2: Stepwise changes (-0.1, -0.05, 0, +0.05, +0.1 mcg/kg/min)", flush=True)
-    print("  - Total: 10 discrete actions", flush=True)
-    print("  - Alpha values: 0.0, 0.001, 0.01", flush=True)
-    print("  - Consistent hyperparameters (tau=0.8, lr=1e-3)", flush=True)
+    """Train Stepwise CQL with command-line arguments"""
+    import argparse
     
-    # Alpha values to train
-    alphas = [0.0001]  # Start with one alpha for testing
+    parser = argparse.ArgumentParser(description='Train Stepwise CQL')
+    parser.add_argument('--alpha', type=float, required=True,
+                        help='CQL regularization parameter')
+    parser.add_argument('--max_step', type=float, required=True,
+                        help='Maximum step size for VP2 changes')
+    args = parser.parse_args()
     
-    # Train models for each alpha
-    for alpha in alphas:
-        agent, pipeline = train_unified_stepwise_cql(alpha=alpha, max_step=0.1)
+    print("="*70, flush=True)
+    print(f" STEPWISE CQL TRAINING", flush=True)
+    print("="*70, flush=True)
+    print(f"\nTraining configuration:", flush=True)
+    print(f"  - Alpha: {args.alpha}", flush=True)
+    print(f"  - Max step: {args.max_step}", flush=True)
+    print(f"  - VP1: Binary (0 or 1)", flush=True)
+    print(f"  - VP2: Stepwise changes with max_step={args.max_step}", flush=True)
+    print(f"  - Hyperparameters: tau=0.8, lr=1e-3", flush=True)
+    
+    # Train model
+    agent, pipeline = train_unified_stepwise_cql(alpha=args.alpha, max_step=args.max_step)
     
     print("\n" + "="*70, flush=True)
-    print(" ALL TRAINING COMPLETE", flush=True)
+    print(" TRAINING COMPLETE", flush=True)
     print("="*70, flush=True)
-    print("\nModels saved in experiment/ directory:", flush=True)
-    for alpha in alphas:
-        print(f"  Alpha {alpha}: stepwise_cql_alpha{alpha:.6f}_*.pt", flush=True)
+    print(f"\nModel saved: stepwise_cql_alpha{args.alpha:.6f}_maxstep{args.max_step:.1f}_*.pt", flush=True)
 
 
 if __name__ == "__main__":

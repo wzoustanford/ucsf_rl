@@ -101,11 +101,26 @@ class CQLAgent:
         self.q2.load_state_dict(checkpoint['q2_state_dict'])
         print(f"  Model loaded from {path}")
         
-    def get_q_values(self, states: torch.Tensor) -> torch.Tensor:
+    def get_q_values_all_actions(self, states: torch.Tensor) -> torch.Tensor:
         """Get Q-values for all actions using double Q-learning"""
         with torch.no_grad():
-            q1_values = self.q1(states)
-            q2_values = self.q2(states)
+            batch_size = states.shape[0]
+            num_actions = self.q1.total_actions
+            
+            # Collect Q-values for all actions
+            q1_values_list = []
+            q2_values_list = []
+            
+            for action_idx in range(num_actions):
+                action_tensor = torch.full((batch_size,), action_idx, dtype=torch.long).to(self.device)
+                q1_val = self.q1(states, action_tensor)
+                q2_val = self.q2(states, action_tensor)
+                q1_values_list.append(q1_val.squeeze(-1))
+                q2_values_list.append(q2_val.squeeze(-1))
+            
+            # Stack and take minimum
+            q1_values = torch.stack(q1_values_list, dim=1)
+            q2_values = torch.stack(q2_values_list, dim=1)
             return torch.min(q1_values, q2_values)
 
 
@@ -126,7 +141,7 @@ class BlockDiscreteCQLAgent(CQLAgent):
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             
             # Get Q-values for all actions (2 * vp2_bins total actions)
-            q_values = self.get_q_values(state_tensor)
+            q_values = self.get_q_values_all_actions(state_tensor)
             
             # Select action with highest Q-value
             action_idx = torch.argmax(q_values, dim=1).item()
@@ -139,7 +154,7 @@ class BlockDiscreteCQLAgent(CQLAgent):
             states_tensor = torch.FloatTensor(states).to(self.device)
             
             # Get Q-values for all actions
-            q_values = self.get_q_values(states_tensor)
+            q_values = self.get_q_values_all_actions(states_tensor)
             
             # Select actions with highest Q-values
             action_indices = torch.argmax(q_values, dim=1).cpu().numpy()
@@ -161,7 +176,7 @@ class BlockDiscreteCQLAgent(CQLAgent):
             states_tensor = torch.FloatTensor(states).to(self.device)
             
             # Get Q-values for all actions
-            q_values = self.get_q_values(states_tensor)  # [batch_size, num_actions]
+            q_values = self.get_q_values_all_actions(states_tensor)  # [batch_size, num_actions]
             
             # Apply softmax with temperature
             probs = torch.softmax(q_values / temperature, dim=1)
@@ -172,7 +187,7 @@ class BlockDiscreteCQLAgent(CQLAgent):
         """Get log probabilities for numerical stability"""
         with torch.no_grad():
             states_tensor = torch.FloatTensor(states).to(self.device)
-            q_values = self.get_q_values(states_tensor)
+            q_values = self.get_q_values_all_actions(states_tensor)
             log_probs = torch.log_softmax(q_values / temperature, dim=1)
             return log_probs.cpu().numpy()
 
@@ -216,7 +231,7 @@ class DataLoader:
         for split_name, split_data in [('train', train_data), ('val', val_data), ('test', test_data)]:
             if split_data is not None:
                 states = split_data['states']
-                actions = split_data['actions'] 
+                actions = split_data['actions']  # This is [n_samples, 2] for dual model
                 rewards = split_data['rewards']
                 patient_ids = split_data.get('patient_ids', np.arange(len(states)))
                 
@@ -228,7 +243,21 @@ class DataLoader:
         
         # Concatenate all data
         self.states = np.vstack(all_states)
-        self.actions = np.concatenate(all_actions)
+        self.actions_raw = np.concatenate(all_actions)  # Keep raw [VP1, VP2] format
+        
+        # Convert actions to combined index format for block discrete
+        # actions_raw[:, 0] is VP1 (binary)
+        # actions_raw[:, 1] is VP2 (continuous, needs discretization)
+        vp1_actions = self.actions_raw[:, 0].astype(int)  # Already binary
+        
+        # Discretize VP2 into bins
+        vp2_continuous = self.actions_raw[:, 1]
+        vp2_actions = np.digitize(vp2_continuous, self.vp2_bin_edges[1:])  # bins from 0 to vp2_bins-1
+        vp2_actions = np.clip(vp2_actions, 0, self.vp2_bins - 1)
+        
+        # Combine into single action index: action = vp1 * vp2_bins + vp2
+        self.actions = vp1_actions * self.vp2_bins + vp2_actions
+        
         self.rewards = np.concatenate(all_rewards)
         self.patient_ids = np.concatenate(all_patient_ids)
         self.splits = np.array(all_splits)
@@ -265,17 +294,29 @@ class DataLoader:
 
 
 # ============================================================================
-# KDE Importance Sampling
+# Binary KDE Importance Sampling (for VP1 or simple binary actions)
 # ============================================================================
 
-class KDEImportanceSampler:
+class BinaryKDEImportanceSampler:
     """KDE-based importance sampling for binary actions"""
     
     def __init__(self, bandwidth: float = 0.1):
         self.bandwidth = bandwidth
         
     def fit_policy(self, states: np.ndarray, actions: np.ndarray) -> Dict:
-        """Fit KDE for a policy"""
+        """
+        Fit KDE for a binary action policy
+        
+        Args:
+            states: State observations [n_samples, state_dim]
+            actions: Binary actions [n_samples] with values 0 or 1
+            
+        Returns:
+            Dictionary containing:
+                - 'prior': P(a=1) marginal probability
+                - 'n_a0', 'n_a1': Number of samples for each action
+                - 'kde_a0', 'kde_a1': Fitted KDE models for P(s|a)
+        """
         # Separate states by action
         states_a0 = states[actions == 0]
         states_a1 = states[actions == 1]
@@ -286,7 +327,7 @@ class KDEImportanceSampler:
             'n_a1': len(states_a1)
         }
         
-        # Fit KDEs
+        # Fit KDEs for P(s|a=0) and P(s|a=1)
         if len(states_a0) > 0:
             policy_kde['kde_a0'] = KernelDensity(kernel='gaussian', bandwidth=self.bandwidth)
             policy_kde['kde_a0'].fit(states_a0)
@@ -298,9 +339,22 @@ class KDEImportanceSampler:
         return policy_kde
     
     def compute_action_prob(self, states: np.ndarray, policy_kde: Dict) -> np.ndarray:
-        """Compute P(a=1|s) using Bayes rule"""
+        """
+        Compute P(a=1|s) using Bayes rule
+        
+        Bayes rule: P(a=1|s) = P(s|a=1)P(a=1) / P(s)
+        where P(s) = P(s|a=0)P(a=0) + P(s|a=1)P(a=1)
+        
+        Args:
+            states: States to compute probabilities for [n_samples, state_dim]
+            policy_kde: Fitted KDE policy dictionary
+            
+        Returns:
+            P(a=1|s) for each state [n_samples]
+        """
         n = len(states)
         
+        # Handle edge cases
         if policy_kde['n_a0'] == 0:
             return np.ones(n) * policy_kde['prior']
         if policy_kde['n_a1'] == 0:
@@ -314,19 +368,19 @@ class KDEImportanceSampler:
             end_idx = min(i + batch_size, n)
             batch_states = states[i:end_idx]
             
-            # Log probabilities
+            # Log probabilities P(s|a)
             log_p_s_a0 = policy_kde['kde_a0'].score_samples(batch_states)
             log_p_s_a1 = policy_kde['kde_a1'].score_samples(batch_states)
             
-            # Priors
+            # Log priors P(a)
             log_p_a0 = np.log(1 - policy_kde['prior'] + 1e-10)
             log_p_a1 = np.log(policy_kde['prior'] + 1e-10)
             
-            # Joint
+            # Log joint probabilities P(s,a) = P(s|a)P(a)
             log_joint_a0 = log_p_s_a0 + log_p_a0
             log_joint_a1 = log_p_s_a1 + log_p_a1
             
-            # Normalize
+            # Normalize using log-sum-exp for numerical stability
             log_normalizer = np.logaddexp(log_joint_a0, log_joint_a1)
             prob_a1[i:end_idx] = np.exp(log_joint_a1 - log_normalizer)
         
@@ -334,22 +388,352 @@ class KDEImportanceSampler:
     
     def compute_importance_weights(self, states: np.ndarray, actions: np.ndarray,
                                   behavioral_kde: Dict, target_kde: Dict) -> np.ndarray:
-        """Compute w(s,a) = p(a|s) / q(a|s)"""
+        """
+        Compute importance weights w(s,a) = π_target(a|s) / π_behavioral(a|s)
         
-        # Get action probabilities
+        Args:
+            states: States [n_samples, state_dim]
+            actions: Binary actions taken [n_samples]
+            behavioral_kde: KDE for behavioral policy
+            target_kde: KDE for target policy
+            
+        Returns:
+            Importance weights [n_samples]
+        """
+        # Get P(a=1|s) for both policies
         prob_behavioral = self.compute_action_prob(states, behavioral_kde)
         prob_target = self.compute_action_prob(states, target_kde)
         
-        # Compute weights
+        # Compute weights based on actual actions
         weights = np.zeros(len(states))
         
-        # For a=1
+        # For a=1: w = P_target(a=1|s) / P_behavioral(a=1|s)
         mask_a1 = (actions == 1)
         weights[mask_a1] = prob_target[mask_a1] / (prob_behavioral[mask_a1] + 1e-10)
         
-        # For a=0
+        # For a=0: w = P_target(a=0|s) / P_behavioral(a=0|s)
+        #           = (1 - P_target(a=1|s)) / (1 - P_behavioral(a=1|s))
         mask_a0 = (actions == 0)
         weights[mask_a0] = (1 - prob_target[mask_a0]) / (1 - prob_behavioral[mask_a0] + 1e-10)
+        
+        return np.clip(weights, 0, 20)
+
+
+# ============================================================================
+# Block Discrete KDE Importance Sampling (for VP1 + VP2 joint actions)
+# ============================================================================
+
+class BlockDiscreteKDEImportanceSampler:
+    """
+    KDE-based importance sampling for block discrete actions (VP1 x VP2)
+    Uses factorization: P(a1,a2|s) = P(a2|a1,s) * P(a1|s)
+    where a1 is VP1 (binary) and a2 is VP2 (discrete)
+    """
+    
+    def __init__(self, bandwidth: float = 0.1, vp2_bins: int = 5):
+        self.bandwidth = bandwidth
+        self.vp2_bins = vp2_bins
+        self.num_actions = 2 * vp2_bins  # Total combined actions
+        
+    def decode_action(self, action_idx: int) -> Tuple[int, int]:
+        """
+        Decode combined action index into VP1 and VP2 actions
+        Action encoding: action_idx = vp1 * vp2_bins + vp2
+        
+        Args:
+            action_idx: Combined action index (0 to num_actions-1)
+            
+        Returns:
+            (vp1, vp2) tuple where vp1 in {0,1} and vp2 in {0,...,vp2_bins-1}
+        """
+        vp1 = action_idx // self.vp2_bins
+        vp2 = action_idx % self.vp2_bins
+        return vp1, vp2
+    
+    def encode_action(self, vp1: int, vp2: int) -> int:
+        """
+        Encode VP1 and VP2 into combined action index
+        
+        Args:
+            vp1: Binary action for VP1 (0 or 1)
+            vp2: Discrete action for VP2 (0 to vp2_bins-1)
+            
+        Returns:
+            Combined action index
+        """
+        return vp1 * self.vp2_bins + vp2
+    
+    def fit_policy(self, states: np.ndarray, actions: np.ndarray) -> Dict:
+        """
+        Fit KDE for a policy with factorized conditional probabilities
+        P(a1,a2|s) = P(a2|a1,s) * P(a1|s)
+        
+        Args:
+            states: State observations [n_samples, state_dim]
+            actions: Combined action indices [n_samples]
+        
+        Returns:
+            Dictionary containing KDEs for P(a1|s) and P(a2|a1,s)
+        """
+        n_samples = len(actions)
+        
+        # Decode actions into VP1 and VP2
+        vp1_actions = np.zeros(n_samples, dtype=int)
+        vp2_actions = np.zeros(n_samples, dtype=int)
+        
+        for i, action_idx in enumerate(actions):
+            vp1_actions[i], vp2_actions[i] = self.decode_action(int(action_idx))
+        
+        policy_kde = {
+            'vp2_bins': self.vp2_bins,
+            'total_samples': n_samples
+        }
+        
+        # 1. Fit marginal P(a1|s) for VP1
+        states_vp1_0 = states[vp1_actions == 0]
+        states_vp1_1 = states[vp1_actions == 1]
+        
+        policy_kde['vp1_prior'] = vp1_actions.mean()  # P(vp1=1)
+        policy_kde['n_vp1_0'] = len(states_vp1_0)
+        policy_kde['n_vp1_1'] = len(states_vp1_1)
+        
+        if len(states_vp1_0) > 0:
+            policy_kde['kde_vp1_0'] = KernelDensity(kernel='gaussian', bandwidth=self.bandwidth)
+            policy_kde['kde_vp1_0'].fit(states_vp1_0)
+            
+        if len(states_vp1_1) > 0:
+            policy_kde['kde_vp1_1'] = KernelDensity(kernel='gaussian', bandwidth=self.bandwidth)
+            policy_kde['kde_vp1_1'].fit(states_vp1_1)
+        
+        # 2. Fit conditional P(a2|a1,s) for VP2 given VP1
+        for vp1_val in [0, 1]:
+            mask_vp1 = (vp1_actions == vp1_val)
+            states_given_vp1 = states[mask_vp1]
+            vp2_given_vp1 = vp2_actions[mask_vp1]
+            
+            if len(states_given_vp1) > 0:
+                # Store conditional priors P(vp2|vp1)
+                for vp2_val in range(self.vp2_bins):
+                    mask_vp2 = (vp2_given_vp1 == vp2_val)
+                    n_samples_vp2 = mask_vp2.sum()
+                    
+                    key_prefix = f'vp1_{vp1_val}_vp2_{vp2_val}'
+                    policy_kde[f'{key_prefix}_prior'] = n_samples_vp2 / len(vp2_given_vp1)
+                    policy_kde[f'{key_prefix}_n'] = n_samples_vp2
+                    
+                    if n_samples_vp2 > 0:
+                        states_vp2 = states_given_vp1[mask_vp2]
+                        kde = KernelDensity(kernel='gaussian', bandwidth=self.bandwidth)
+                        kde.fit(states_vp2)
+                        policy_kde[f'{key_prefix}_kde'] = kde
+        
+        return policy_kde
+    
+    def compute_vp1_prob(self, states: np.ndarray, policy_kde: Dict) -> np.ndarray:
+        """
+        Compute P(vp1=1|s) using Bayes rule
+        
+        Args:
+            states: States to compute probabilities for [n_samples, state_dim]
+            policy_kde: Fitted KDE policy dictionary
+            
+        Returns:
+            P(vp1=1|s) for each state [n_samples]
+        """
+        n = len(states)
+        
+        if policy_kde['n_vp1_0'] == 0:
+            return np.ones(n) * policy_kde['vp1_prior']
+        if policy_kde['n_vp1_1'] == 0:
+            return np.zeros(n)
+        
+        # Process in batches
+        batch_size = 2000
+        prob_vp1_1 = np.zeros(n)
+        
+        for i in range(0, n, batch_size):
+            end_idx = min(i + batch_size, n)
+            batch_states = states[i:end_idx]
+            
+            # Log probabilities P(s|vp1)
+            log_p_s_vp1_0 = policy_kde['kde_vp1_0'].score_samples(batch_states)
+            log_p_s_vp1_1 = policy_kde['kde_vp1_1'].score_samples(batch_states)
+            
+            # Priors P(vp1)
+            log_p_vp1_0 = np.log(1 - policy_kde['vp1_prior'] + 1e-10)
+            log_p_vp1_1 = np.log(policy_kde['vp1_prior'] + 1e-10)
+            
+            # Joint P(s,vp1)
+            log_joint_vp1_0 = log_p_s_vp1_0 + log_p_vp1_0
+            log_joint_vp1_1 = log_p_s_vp1_1 + log_p_vp1_1
+            
+            # Normalize
+            log_normalizer = np.logaddexp(log_joint_vp1_0, log_joint_vp1_1)
+            prob_vp1_1[i:end_idx] = np.exp(log_joint_vp1_1 - log_normalizer)
+        
+        return np.clip(prob_vp1_1, 1e-6, 1-1e-6)
+    
+    def compute_vp2_prob_given_vp1(self, states: np.ndarray, vp1: int, 
+                                   policy_kde: Dict) -> np.ndarray:
+        """
+        Compute P(vp2|vp1,s) for all VP2 values using Bayes rule
+        
+        Args:
+            states: States to compute probabilities for [n_samples, state_dim]
+            vp1: Conditioning VP1 value (0 or 1)
+            policy_kde: Fitted KDE policy dictionary
+            
+        Returns:
+            P(vp2|vp1,s) for each VP2 value [n_states, vp2_bins]
+        """
+        n_states = len(states)
+        vp2_probs = np.zeros((n_states, self.vp2_bins))
+        
+        # Process in batches
+        batch_size = 2000
+        
+        for i in range(0, n_states, batch_size):
+            end_idx = min(i + batch_size, n_states)
+            batch_states = states[i:end_idx]
+            batch_size_actual = end_idx - i
+            
+            # Compute log probabilities for each VP2 value
+            log_probs = np.full((batch_size_actual, self.vp2_bins), -np.inf)
+            
+            for vp2_val in range(self.vp2_bins):
+                key_prefix = f'vp1_{vp1}_vp2_{vp2_val}'
+                
+                if f'{key_prefix}_kde' in policy_kde and policy_kde[f'{key_prefix}_n'] > 0:
+                    # Log likelihood P(s|vp1,vp2)
+                    log_likelihood = policy_kde[f'{key_prefix}_kde'].score_samples(batch_states)
+                    
+                    # Log conditional prior P(vp2|vp1)
+                    log_prior = np.log(policy_kde[f'{key_prefix}_prior'] + 1e-10)
+                    
+                    # Log joint P(s,vp2|vp1)
+                    log_probs[:, vp2_val] = log_likelihood + log_prior
+            
+            # Normalize to get P(vp2|vp1,s)
+            log_normalizer = np.logaddexp.reduce(log_probs, axis=1, keepdims=True)
+            vp2_probs[i:end_idx] = np.exp(log_probs - log_normalizer)
+        
+        return np.clip(vp2_probs, 1e-8, 1.0)
+    
+    def compute_joint_action_probs(self, states: np.ndarray, policy_kde: Dict) -> np.ndarray:
+        """
+        Compute P(a1,a2|s) = P(a2|a1,s) * P(a1|s) for all action combinations
+        
+        Args:
+            states: States to compute probabilities for [n_samples, state_dim]
+            policy_kde: Fitted KDE policy dictionary
+            
+        Returns:
+            Joint action probabilities [n_states, num_actions]
+        """
+        n_states = len(states)
+        joint_probs = np.zeros((n_states, self.num_actions))
+        
+        # Get P(vp1|s)
+        prob_vp1_1 = self.compute_vp1_prob(states, policy_kde)
+        prob_vp1_0 = 1 - prob_vp1_1
+        
+        # For VP1=0: P(vp1=0,vp2|s) = P(vp2|vp1=0,s) * P(vp1=0|s)
+        vp2_probs_given_vp1_0 = self.compute_vp2_prob_given_vp1(states, 0, policy_kde)
+        for vp2_val in range(self.vp2_bins):
+            action_idx = self.encode_action(0, vp2_val)
+            joint_probs[:, action_idx] = prob_vp1_0 * vp2_probs_given_vp1_0[:, vp2_val]
+        
+        # For VP1=1: P(vp1=1,vp2|s) = P(vp2|vp1=1,s) * P(vp1=1|s)
+        vp2_probs_given_vp1_1 = self.compute_vp2_prob_given_vp1(states, 1, policy_kde)
+        for vp2_val in range(self.vp2_bins):
+            action_idx = self.encode_action(1, vp2_val)
+            joint_probs[:, action_idx] = prob_vp1_1 * vp2_probs_given_vp1_1[:, vp2_val]
+        
+        return joint_probs
+    
+    def compute_importance_weights(self, states: np.ndarray, actions: np.ndarray,
+                                  behavioral_kde: Dict, target_kde: Dict) -> np.ndarray:
+        """
+        Compute importance weights w(s,a) = π_target(a|s) / π_behavioral(a|s)
+        Using factorized probabilities P(a1,a2|s) = P(a2|a1,s) * P(a1|s)
+        
+        Args:
+            states: States [n_samples, state_dim]
+            actions: Combined action indices [n_samples]
+            behavioral_kde: KDE for behavioral policy
+            target_kde: KDE for target policy
+            
+        Returns:
+            Importance weights [n_samples]
+        """
+        # Get joint action probabilities for both policies
+        prob_behavioral = self.compute_joint_action_probs(states, behavioral_kde)
+        prob_target = self.compute_joint_action_probs(states, target_kde)
+        
+        # Extract probabilities for actual actions taken
+        n_samples = len(actions)
+        weights = np.zeros(n_samples)
+        
+        for i in range(n_samples):
+            action_idx = int(actions[i])
+            weights[i] = prob_target[i, action_idx] / (prob_behavioral[i, action_idx] + 1e-10)
+        
+        return np.clip(weights, 0, 20)
+
+
+# ============================================================================
+# Q-Softmax Importance Sampling (Simple backup version)
+# ============================================================================
+
+class QSoftmaxImportanceSampler:
+    """Simple Q-value softmax-based importance sampling"""
+    
+    def __init__(self, temperature: float = 1.0):
+        self.temperature = temperature
+        
+    def get_action_probs(self, states: np.ndarray, agent: BlockDiscreteCQLAgent, 
+                        temperature: float = None) -> np.ndarray:
+        """Get action probabilities from Q-values using softmax"""
+        if temperature is None:
+            temperature = self.temperature
+            
+        with torch.no_grad():
+            states_tensor = torch.FloatTensor(states).to(agent.device)
+            batch_size = states_tensor.shape[0]
+            num_actions = agent.q1.total_actions
+            
+            # Collect Q-values for all actions
+            q_values_list = []
+            for action_idx in range(num_actions):
+                action_tensor = torch.full((batch_size,), action_idx, dtype=torch.long).to(agent.device)
+                q1 = agent.q1(states_tensor, action_tensor)
+                q2 = agent.q2(states_tensor, action_tensor)
+                q_values_list.append(torch.min(q1, q2).squeeze(-1))
+            
+            # Stack and apply softmax
+            q_values = torch.stack(q_values_list, dim=1)
+            probs = torch.softmax(q_values / temperature, dim=1)
+            
+            return probs.cpu().numpy()
+    
+    def compute_importance_weights(self, states: np.ndarray, actions: np.ndarray,
+                                  target_agent: BlockDiscreteCQLAgent,
+                                  behavioral_agent: BlockDiscreteCQLAgent = None) -> np.ndarray:
+        """Compute importance weights w(s,a) = π_target(a|s) / π_behavioral(a|s)"""
+        
+        # Get probabilities
+        prob_target = self.get_action_probs(states, target_agent)
+        
+        if behavioral_agent is not None:
+            prob_behavioral = self.get_action_probs(states, behavioral_agent)
+        else:
+            # Assume uniform behavioral policy
+            prob_behavioral = np.ones_like(prob_target) / prob_target.shape[1]
+        
+        # Compute weights for actual actions
+        weights = np.zeros(len(actions))
+        for i, action in enumerate(actions):
+            weights[i] = prob_target[i, int(action)] / (prob_behavioral[i, int(action)] + 1e-10)
         
         return np.clip(weights, 0, 20)
 
@@ -359,12 +743,30 @@ class KDEImportanceSampler:
 # ============================================================================
 
 class OPEEvaluator:
-    """Off-Policy Evaluation using importance sampling"""
+    """Off-Policy Evaluation using multiple importance sampling methods"""
     
-    def __init__(self, kde_bandwidth: float = 0.1):
-        self.kde_sampler = KDEImportanceSampler(bandwidth=kde_bandwidth)
+    def __init__(self, method: str = 'block_kde', kde_bandwidth: float = 0.1, 
+                 vp2_bins: int = 5, temperature: float = 1.0):
+        """
+        Args:
+            method: 'binary_kde', 'block_kde', or 'q_softmax'
+            kde_bandwidth: Bandwidth for KDE methods
+            vp2_bins: Number of VP2 bins for block discrete actions
+            temperature: Softmax temperature for Q-softmax method
+        """
+        self.method = method
+        self.vp2_bins = vp2_bins
         
-    def evaluate(self, data: DataLoader, agent: CQLAgent,
+        if method == 'binary_kde':
+            self.sampler = BinaryKDEImportanceSampler(bandwidth=kde_bandwidth)
+        elif method == 'block_kde':
+            self.sampler = BlockDiscreteKDEImportanceSampler(bandwidth=kde_bandwidth, vp2_bins=vp2_bins)
+        elif method == 'q_softmax':
+            self.sampler = QSoftmaxImportanceSampler(temperature=temperature)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        
+    def evaluate(self, data: DataLoader, agent: BlockDiscreteCQLAgent,
                 train_mask: np.ndarray, test_mask: np.ndarray) -> Dict:
         """
         Evaluate agent using importance sampling
@@ -375,9 +777,8 @@ class OPEEvaluator:
         
         # Generate learned policy actions
         print("\n  Generating learned policy actions...")
-        # Process in batches for efficiency
         batch_size = 10000
-        learned_actions = np.zeros(len(data.states))
+        learned_actions = np.zeros(len(data.states), dtype=int)
         
         for i in range(0, len(data.states), batch_size):
             end_idx = min(i + batch_size, len(data.states))
@@ -389,61 +790,57 @@ class OPEEvaluator:
             
             if (i // batch_size) % 2 == 0:
                 print(f"    Processed {end_idx}/{len(data.states)} samples...")
+        
+        # Compute importance weights based on method
+        print(f"\n  Computing importance weights using {self.method}...")
+        
+        if self.method in ['binary_kde', 'block_kde']:
+            # KDE-based methods
+            print("  Fitting KDE models...")
+            print(f"    Training samples: {train_mask.sum()}")
             
-        # Fit KDEs on training data
-        print("  Fitting KDE models...")
-        print(f"    Training samples: {train_mask.sum()}")
-        
-        # Subsample training data for faster KDE fitting
-        max_kde_samples = 10000
-        train_indices = np.where(train_mask)[0]
-        if len(train_indices) > max_kde_samples:
-            np.random.seed(42)
-            train_indices = np.random.choice(train_indices, max_kde_samples, replace=False)
-            print(f"    Subsampling to {max_kde_samples} samples for KDE fitting")
-        
-        behavioral_kde = self.kde_sampler.fit_policy(
-            data.states_scaled[train_indices],
-            data.actions[train_indices]
-        )
-        print("    Behavioral KDE fitted")
-        
-        target_kde = self.kde_sampler.fit_policy(
-            data.states_scaled[train_indices],
-            learned_actions[train_indices]
-        )
-        
-        print(f"    Behavioral P(a=1): {behavioral_kde['prior']:.3f} (per-timestep)")
-        print(f"    Learned P(a=1): {target_kde['prior']:.3f} (per-timestep)")
-        
-        # Also compute per-patient statistics
-        if hasattr(data, 'patient_groups') and data.patient_groups:
-            behavioral_patient_stats = []
-            learned_patient_stats = []
+            # Subsample training data for faster KDE fitting
+            max_kde_samples = 10000
+            train_indices = np.where(train_mask)[0]
+            if len(train_indices) > max_kde_samples:
+                np.random.seed(42)
+                train_indices = np.random.choice(train_indices, max_kde_samples, replace=False)
+                print(f"    Subsampling to {max_kde_samples} samples for KDE fitting")
             
-            for patient_id, (start_idx, end_idx) in data.patient_groups.items():
-                # Get actions for this patient
-                patient_behavioral = data.actions[start_idx:end_idx]
-                patient_learned = learned_actions[start_idx:end_idx]
-                
-                # Compute proportion of a=1 for this patient
-                behavioral_patient_stats.append(patient_behavioral.mean())
-                learned_patient_stats.append(patient_learned.mean())
+            # Fit KDEs
+            behavioral_kde = self.sampler.fit_policy(
+                data.states_scaled[train_indices],
+                data.actions[train_indices]
+            )
+            print("    Behavioral KDE fitted")
             
-            print(f"    Per-patient stats:")
-            print(f"      Behavioral: mean={np.mean(behavioral_patient_stats):.3f}, "
-                  f"std={np.std(behavioral_patient_stats):.3f}")
-            print(f"      Learned: mean={np.mean(learned_patient_stats):.3f}, "
-                  f"std={np.std(learned_patient_stats):.3f}")
+            target_kde = self.sampler.fit_policy(
+                data.states_scaled[train_indices],
+                learned_actions[train_indices]
+            )
+            print("    Target KDE fitted")
+            
+            # Compute importance weights on test set
+            weights = self.sampler.compute_importance_weights(
+                data.states_scaled[test_mask],
+                data.actions[test_mask],
+                behavioral_kde,
+                target_kde
+            )
+            
+        elif self.method == 'q_softmax':
+            # Q-softmax method - no KDE fitting needed
+            print("  Using Q-values directly (no KDE fitting required)")
+            
+            # For Q-softmax, we use the learned agent as target
+            # and can either use uniform or another agent as behavioral
+            weights = self.sampler.compute_importance_weights(
+                data.states_scaled[test_mask],
+                data.actions[test_mask],
+                target_agent=agent,
+                behavioral_agent=None  # Use uniform behavioral policy
+            )
         
-        # Compute importance weights on test set
-        print("  Computing importance weights...")
-        weights = self.kde_sampler.compute_importance_weights(
-            data.states_scaled[test_mask],
-            data.actions[test_mask],
-            behavioral_kde,
-            target_kde
-        )
         print(f"    Computed weights for {len(weights)} test samples")
         
         # Compute estimates
@@ -558,49 +955,50 @@ def visualize_ope_results(results: Dict, save_path: Optional[str] = None):
 # Main Evaluation Function
 # ============================================================================
 
-def evaluate_cql_model(model_path: str, model_type: str = 'binary',
-                       data_path: str = 'sample_data_oviss.csv') -> Dict:
+def evaluate_block_discrete_cql(model_path: str, vp2_bins: int = 10, 
+                                method: str = 'block_kde', 
+                                temperature: float = 1.0) -> Dict:
     """
-    Main function to evaluate a CQL model
+    Evaluate a block discrete CQL model using importance sampling
     
     Args:
-        model_path: Path to saved model
-        model_type: Type of model ('binary', 'dual_continuous', 'dual_discrete')
-        data_path: Path to data file
+        model_path: Path to saved model (e.g., 'experiment/block_discrete_cql_alpha0.0000_bins10_best.pt')
+        vp2_bins: Number of VP2 bins (must match the model)
+        method: 'block_kde', 'binary_kde', or 'q_softmax'
+        temperature: Softmax temperature for q_softmax method
         
     Returns:
         Dictionary with evaluation results
     """
     
     print("=" * 60)
-    print("CQL OFF-POLICY EVALUATION")
+    print("BLOCK DISCRETE CQL OFF-POLICY EVALUATION")
     print("=" * 60)
+    print(f"Model: {model_path}")
+    print(f"VP2 bins: {vp2_bins}")
+    print(f"Method: {method}")
     
     # Load data
     print("\n1. Loading data...")
-    data = DataLoader(model_type)
+    data = DataLoader(model_type='dual', vp2_bins=vp2_bins)
     
     # Load model
     print("\n2. Loading CQL model...")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
     
-    if model_type == 'binary':
-        agent = BinaryCQLAgent(state_dim=data.states.shape[1])
-    else:
-        raise NotImplementedError(f"Model type {model_type} not yet supported")
-    
+    agent = BlockDiscreteCQLAgent(state_dim=data.states.shape[1], vp2_bins=vp2_bins)
     agent.load(model_path)
     
     # Split data
     print("\n3. Splitting data...")
     train_mask, test_mask = data.get_train_test_masks()
-    print(f"  Train: {train_mask.sum()} samples")
+    print(f"  Train+Val: {train_mask.sum()} samples")
     print(f"  Test: {test_mask.sum()} samples")
     
     # Evaluate
     print("\n4. Running OPE...")
-    evaluator = OPEEvaluator()
+    evaluator = OPEEvaluator(method=method, vp2_bins=vp2_bins, temperature=temperature)
     results = evaluator.evaluate(data, agent, train_mask, test_mask)
     
     # Print results
@@ -634,11 +1032,57 @@ def evaluate_cql_model(model_path: str, model_type: str = 'binary',
 # ============================================================================
 
 if __name__ == "__main__":
-    # Example usage
-    model_path = 'experiment/binary_cql_unified_alpha01_best.pt'
+    import argparse
     
-    if os.path.exists(model_path):
-        results = evaluate_cql_model(model_path, model_type='binary')
+    parser = argparse.ArgumentParser(description='Evaluate Block Discrete CQL with OPE')
+    parser.add_argument('--model_path', type=str, 
+                       default='experiment/block_discrete_cql_alpha0.0000_bins10_best.pt',
+                       help='Path to model checkpoint')
+    parser.add_argument('--vp2_bins', type=int, default=10,
+                       help='Number of VP2 bins (must match model)')
+    parser.add_argument('--method', type=str, default='block_kde',
+                       choices=['binary_kde', 'block_kde', 'q_softmax'],
+                       help='Importance sampling method')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                       help='Softmax temperature for q_softmax method')
+    parser.add_argument('--compare_methods', action='store_true',
+                       help='Compare all three methods')
+    
+    args = parser.parse_args()
+    
+    if args.compare_methods:
+        # Compare all three methods
+        print("\n" + "="*80)
+        print("COMPARING ALL IMPORTANCE SAMPLING METHODS")
+        print("="*80)
+        
+        all_results = {}
+        for method in ['block_kde', 'q_softmax']:
+            print(f"\n\n>>> Method: {method.upper()}")
+            results = evaluate_block_discrete_cql(
+                args.model_path, 
+                vp2_bins=args.vp2_bins, 
+                method=method,
+                temperature=args.temperature
+            )
+            all_results[method] = results
+        
+        # Compare results
+        print("\n" + "="*80)
+        print("COMPARISON SUMMARY")
+        print("="*80)
+        print(f"{'Method':<15} {'Behavioral':<12} {'IS Estimate':<12} {'WIS Estimate':<12} {'ESS Ratio':<12}")
+        print("-"*63)
+        
+        for method, res in all_results.items():
+            print(f"{method:<15} {res['behavioral_reward']:.4f}      "
+                  f"{res['is_estimate']:.4f}       {res['wis_estimate']:.4f}       "
+                  f"{res['ess_ratio']*100:.1f}%")
     else:
-        print(f"Model not found: {model_path}")
-        print("Please train the binary CQL model first")
+        # Single method evaluation
+        results = evaluate_block_discrete_cql(
+            args.model_path,
+            vp2_bins=args.vp2_bins,
+            method=args.method,
+            temperature=args.temperature
+        )

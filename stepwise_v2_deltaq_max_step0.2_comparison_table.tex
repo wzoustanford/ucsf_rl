@@ -1,0 +1,18 @@
+\begin{table}[ht]
+\centering
+\caption{Comparison of Binary CQL and Stepwise CQL models with vasopressor persistence policy}
+\label{tab:stepwise_comparison}
+\begin{tabular}{lccccccc}
+\toprule
+Model & $\alpha$ & VP1 (\%) & VP2 (\%) & Q/time & $\Delta$Q & VP1 C. (\%) & VP2 C. (\%) \\
+\midrule
+Clinician & -- & 38.8 & 99.8 & 0.000 & 0.000 & 100.0 & -- \\
+\midrule
+Binary CQL & 0.001 & 79.8 & -- & 0.869 & 0.028 & 44.5 & -- \\
+Stepwise CQL & 0.000000 & 97.3 & 100.0 & 4.021 & 0.511 & 38.1 & 11.7 \\
+Stepwise CQL & 0.000100 & 31.3 & 100.0 & 0.134 & 0.143 & 70.8 & 16.4 \\
+Stepwise CQL & 0.001000 & 62.0 & 100.0 & 0.177 & 0.130 & 61.2 & 24.1 \\
+Stepwise CQL & 0.010000 & 38.7 & 100.0 & -0.184 & 0.254 & 64.6 & 13.5 \\
+\bottomrule
+\end{tabular}
+\end{table}

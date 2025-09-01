@@ -99,6 +99,8 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
     q_values_patient = []
     vp1_concordances = []
     vp2_concordances = []  # For block discrete models only
+    delta_q_timestep = []  # Delta Q per timestep
+    delta_q_patient = []  # Delta Q per patient
     
     # Process each patient
     for patient_id, (start_idx, end_idx) in patient_groups.items():
@@ -106,6 +108,7 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
         patient_actions = test_data['actions'][start_idx:end_idx]
         
         patient_q_values = []
+        patient_delta_q = []  # Track delta Q for this patient
         patient_vp1_concordance = []
         patient_vp2_concordance = []  # For block discrete only
         vp1_used = False
@@ -123,16 +126,30 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
                     model_action = policy.select_action(state, patient_id, epsilon=0.0)
                     q0, q1 = policy.get_q_values(state)
                     q_val = max(q0, q1)
+                    # Get Q-value for clinician action
+                    q_clinician = q0 if clinician_action == 0 else q1
                 else:
                     model_action_arr = agent.select_action(state, epsilon=0.0)
                     model_action = int(model_action_arr[0])
                     
                     with torch.no_grad():
                         state_t = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
+                        # Q-value for model's optimal action
                         action_t = torch.FloatTensor([model_action]).unsqueeze(0).to(agent.device)
                         q1 = agent.q1(state_t, action_t).item()
                         q2 = agent.q2(state_t, action_t).item()
                         q_val = min(q1, q2)
+                        
+                        # Q-value for clinician's action
+                        clinician_action_t = torch.FloatTensor([clinician_action]).unsqueeze(0).to(agent.device)
+                        q1_clin = agent.q1(state_t, clinician_action_t).item()
+                        q2_clin = agent.q2(state_t, clinician_action_t).item()
+                        q_clinician = min(q1_clin, q2_clin)
+                
+                # Calculate delta Q (model optimal - clinician)
+                delta_q = q_val - q_clinician
+                patient_delta_q.append(delta_q)
+                delta_q_timestep.append(delta_q)
                 
                 if model_action > 0:
                     vp1_used = True
@@ -143,6 +160,8 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
                     # Use policy wrapper with persistence
                     model_action = policy.select_action(state, patient_id)
                     q_val = policy.get_q_value(state, model_action)
+                    # Get Q-value for clinician action
+                    q_clinician = policy.get_q_value(state, clinician_action)
                 else:
                     # Use agent directly
                     model_action = agent.select_action(state)
@@ -151,20 +170,39 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
                         # For block discrete, need to get Q-value differently
                         with torch.no_grad():
                             state_t = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
-                            # Convert continuous action to discrete index for Q-value computation
+                            # Q-value for model's optimal action
                             action_idx = agent.continuous_to_discrete_action(model_action)
                             action_idx_t = torch.LongTensor([action_idx]).to(agent.device)
                             q1 = agent.q1(state_t, action_idx_t).item()
                             q2 = agent.q2(state_t, action_idx_t).item()
                             q_val = min(q1, q2)
+                            
+                            # Q-value for clinician's action
+                            clinician_idx = agent.continuous_to_discrete_action(clinician_action)
+                            clinician_idx_t = torch.LongTensor([clinician_idx]).to(agent.device)
+                            q1_clin = agent.q1(state_t, clinician_idx_t).item()
+                            q2_clin = agent.q2(state_t, clinician_idx_t).item()
+                            q_clinician = min(q1_clin, q2_clin)
                     else:
                         # Dual mixed model
                         with torch.no_grad():
                             state_t = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
+                            # Q-value for model's optimal action
                             action_t = torch.FloatTensor(model_action).unsqueeze(0).to(agent.device)
                             q1 = agent.q1(state_t, action_t).item()
                             q2 = agent.q2(state_t, action_t).item()
                             q_val = min(q1, q2)
+                            
+                            # Q-value for clinician's action
+                            clinician_action_t = torch.FloatTensor(clinician_action).unsqueeze(0).to(agent.device)
+                            q1_clin = agent.q1(state_t, clinician_action_t).item()
+                            q2_clin = agent.q2(state_t, clinician_action_t).item()
+                            q_clinician = min(q1_clin, q2_clin)
+                
+                # Calculate delta Q
+                delta_q = q_val - q_clinician
+                patient_delta_q.append(delta_q)
+                delta_q_timestep.append(delta_q)
                 
                 # VP1 is binary (0 or 1), VP2 is continuous [0, 0.5]
                 if model_action[0] > 0:  # VP1 is binary
@@ -199,6 +237,7 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
         if model_type in ['dual', 'block_discrete']:
             vp2_usage.append(vp2_used)
         q_values_patient.append(np.mean(patient_q_values))
+        delta_q_patient.append(np.mean(patient_delta_q))  # Add patient-level delta Q
         vp1_concordances.append(np.mean(patient_vp1_concordance))
         if model_type == 'block_discrete' and patient_vp2_concordance:
             vp2_concordances.append(np.mean(patient_vp2_concordance))
@@ -209,6 +248,8 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
         'vp2_usage': np.mean(vp2_usage) * 100 if vp2_usage else None,
         'q_per_timestep': np.mean(q_values_timestep),
         'q_per_patient': np.mean(q_values_patient),
+        'delta_q_per_timestep': np.mean(delta_q_timestep),  # Average delta Q per timestep
+        'delta_q_per_patient': np.mean(delta_q_patient),  # Average delta Q per patient
         'vp1_concordance': np.mean(vp1_concordances) * 100,
         'vp2_concordance': np.mean(vp2_concordances) * 100 if vp2_concordances else None
     }
@@ -255,11 +296,11 @@ def generate_latex_table():
 \centering
 \caption{Comprehensive comparison of CQL models including Binary, Dual Mixed, and Block Discrete (with 3, 5, 10 bins) variants across different conservatism levels ($\alpha$).}
 \label{tab:cql_comparison}
-\begin{tabular}{llcccccc}
+\begin{tabular}{llccccccc}
 \toprule
-Model & Config & $\alpha$ & VP1 (\%) & VP2 (\%) & Q/time & VP1 Conc. (\%) & VP2 Conc. (\%) \\
+Model & Config & $\alpha$ & VP1 (\%) & VP2 (\%) & Q/time & $\Delta$Q & VP1 C. (\%) & VP2 C. (\%) \\
 \midrule
-Clinician & -- & -- & 38.8 & 99.8 & 0.000 & 100.0 & -- \\
+Clinician & -- & -- & 38.8 & 99.8 & 0.000 & 0.000 & 100.0 & -- \\
 \midrule"""
     
     # Add results for each alpha
@@ -278,11 +319,11 @@ Clinician & -- & -- & 38.8 & 99.8 & 0.000 & 100.0 & -- \\
         
         # Binary CQL
         latex += f"""
-Binary CQL & -- & {alpha:.3f} & {fmt(b_res.get('vp1_usage'))} & -- & {fmt(b_res.get('q_per_timestep'), '.3f')} & {fmt(b_res.get('vp1_concordance'))} & -- \\\\"""
+Binary CQL & -- & {alpha:.3f} & {fmt(b_res.get('vp1_usage'))} & -- & {fmt(b_res.get('q_per_timestep'), '.3f')} & {fmt(b_res.get('delta_q_per_timestep'), '.3f')} & {fmt(b_res.get('vp1_concordance'))} & -- \\\\"""
         
         # Dual Mixed CQL
         latex += f"""
-Dual Mixed & -- & {alpha:.3f} & {fmt(d_res.get('vp1_usage'))} & {fmt(d_res.get('vp2_usage'))} & {fmt(d_res.get('q_per_timestep'), '.3f')} & {fmt(d_res.get('vp1_concordance'))} & -- \\\\"""
+Dual Mixed & -- & {alpha:.3f} & {fmt(d_res.get('vp1_usage'))} & {fmt(d_res.get('vp2_usage'))} & {fmt(d_res.get('q_per_timestep'), '.3f')} & {fmt(d_res.get('delta_q_per_timestep'), '.3f')} & {fmt(d_res.get('vp1_concordance'))} & -- \\\\"""
         
         # Block Discrete CQL models
         for bins in [3, 5, 10]:
@@ -290,10 +331,10 @@ Dual Mixed & -- & {alpha:.3f} & {fmt(d_res.get('vp1_usage'))} & {fmt(d_res.get('
             
             if bd_res:
                 latex += f"""
-Block Discrete & {bins} bins & {alpha:.3f} & {fmt(bd_res.get('vp1_usage'))} & {fmt(bd_res.get('vp2_usage'))} & {fmt(bd_res.get('q_per_timestep'), '.3f')} & {fmt(bd_res.get('vp1_concordance'))} & {fmt(bd_res.get('vp2_concordance'))} \\\\"""
+Block Discrete & {bins} bins & {alpha:.3f} & {fmt(bd_res.get('vp1_usage'))} & {fmt(bd_res.get('vp2_usage'))} & {fmt(bd_res.get('q_per_timestep'), '.3f')} & {fmt(bd_res.get('delta_q_per_timestep'), '.3f')} & {fmt(bd_res.get('vp1_concordance'))} & {fmt(bd_res.get('vp2_concordance'))} \\\\"""
             else:
                 latex += f"""
-Block Discrete & {bins} bins & {alpha:.3f} & N/A & N/A & N/A & N/A & N/A \\\\"""
+Block Discrete & {bins} bins & {alpha:.3f} & N/A & N/A & N/A & N/A & N/A & N/A \\\\"""
         
         if alpha in [0.0, 0.001]:  # Add separator after each alpha group except the last
             latex += "\n\\midrule"
@@ -304,7 +345,7 @@ Block Discrete & {bins} bins & {alpha:.3f} & N/A & N/A & N/A & N/A & N/A \\\\"""
 \end{table}"""
     
     # Save to file
-    with open('table1_cql_comparison.tex', 'w') as f:
+    with open('table1_block_discrete_v2_cql_comparison.tex', 'w') as f:
         f.write(latex)
     
     print("\n✓ LaTeX table saved to: table1_cql_comparison.tex")
@@ -325,12 +366,12 @@ Block Discrete & {bins} bins & {alpha:.3f} & N/A & N/A & N/A & N/A & N/A \\\\"""
                 return f"{val:.3f}"
             return f"{val:.{decimals}f}{suffix}"
         
-        print(f"  Binary CQL:     VP1={safe_fmt(b_res.get('vp1_usage'))}, Q/t={safe_fmt(b_res.get('q_per_timestep'), '', 3)}, VP1-Conc={safe_fmt(b_res.get('vp1_concordance'))}")
-        print(f"  Dual Mixed:     VP1={safe_fmt(d_res.get('vp1_usage'))}, VP2={safe_fmt(d_res.get('vp2_usage'))}, Q/t={safe_fmt(d_res.get('q_per_timestep'), '', 3)}, VP1-Conc={safe_fmt(d_res.get('vp1_concordance'))}")
+        print(f"  Binary CQL:     VP1={safe_fmt(b_res.get('vp1_usage'))}, Q/t={safe_fmt(b_res.get('q_per_timestep'), '', 3)}, ΔQ={safe_fmt(b_res.get('delta_q_per_timestep'), '', 3)}, VP1-Conc={safe_fmt(b_res.get('vp1_concordance'))}")
+        print(f"  Dual Mixed:     VP1={safe_fmt(d_res.get('vp1_usage'))}, VP2={safe_fmt(d_res.get('vp2_usage'))}, Q/t={safe_fmt(d_res.get('q_per_timestep'), '', 3)}, ΔQ={safe_fmt(d_res.get('delta_q_per_timestep'), '', 3)}, VP1-Conc={safe_fmt(d_res.get('vp1_concordance'))}")
         for bins in [3, 5, 10]:
             bd_res = results[alpha]['block_discrete'][bins]
             if bd_res:
-                print(f"  Block Disc({bins:2d}): VP1={safe_fmt(bd_res.get('vp1_usage'))}, VP2={safe_fmt(bd_res.get('vp2_usage'))}, Q/t={safe_fmt(bd_res.get('q_per_timestep'), '', 3)}, VP1-C={safe_fmt(bd_res.get('vp1_concordance'))}, VP2-C={safe_fmt(bd_res.get('vp2_concordance'))}")
+                print(f"  Block Disc({bins:2d}): VP1={safe_fmt(bd_res.get('vp1_usage'))}, VP2={safe_fmt(bd_res.get('vp2_usage'))}, Q/t={safe_fmt(bd_res.get('q_per_timestep'), '', 3)}, ΔQ={safe_fmt(bd_res.get('delta_q_per_timestep'), '', 3)}, VP1-C={safe_fmt(bd_res.get('vp1_concordance'))}, VP2-C={safe_fmt(bd_res.get('vp2_concordance'))}")
             else:
                 print(f"  Block Disc({bins:2d}): N/A")
     

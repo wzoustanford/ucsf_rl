@@ -405,7 +405,7 @@ def train_lstm_block_discrete_cql(
                 alpha_str = f"{alpha:.1e}".replace('.', 'p').replace('-', 'm')
             else:
                 alpha_str = f"{alpha:.4f}"
-            save_path = os.path.join(save_dir, f'lstm_block_discrete_cql_alpha{alpha_str}_bins{vp2_bins}_best.pt')
+            save_path = os.path.join(save_dir, f'lstm_block_discrete_cql_alpha{alpha_str}_bins{vp2_bins}_hdim{hidden_dim}_seql{sequence_length}_best.pt')
             torch.save({
                 'q1_state_dict': agent.q1.state_dict(),
                 'q2_state_dict': agent.q2.state_dict(),
@@ -421,8 +421,7 @@ def train_lstm_block_discrete_cql(
                 'training_history': training_history
             }, save_path)
             
-            if (epoch + 1) % 10 == 0:
-                logger.log(f"  >>> New best model saved at epoch {epoch+1} with Val Q={best_val_q:.6f}")
+            logger.log(f"  >>> New best model saved at epoch {epoch+1} with Val Q={best_val_q:.6f}")
         
         # Detailed logging every N epochs
         if (epoch + 1) % 5 == 0:
@@ -446,7 +445,7 @@ def train_lstm_block_discrete_cql(
         alpha_str = f"{alpha:.1e}".replace('.', 'p').replace('-', 'm')
     else:
         alpha_str = f"{alpha:.4f}"
-    final_save_path = os.path.join(save_dir, f'lstm_block_discrete_cql_alpha{alpha_str}_bins{vp2_bins}_final.pt')
+    final_save_path = os.path.join(save_dir, f'lstm_block_discrete_cql_alpha{alpha_str}_bins{vp2_bins}_hdim{hidden_dim}_seql{sequence_length}_final.pt')
     torch.save({
         'q1_state_dict': agent.q1.state_dict(),
         'q2_state_dict': agent.q2.state_dict(),
@@ -501,7 +500,7 @@ def main():
         lstm_hidden=64,
         num_lstm_layers=2,
         batch_size=32,
-        epochs=100,  # Full 100 epochs
+        epochs=200,  # Full 100 epochs
         learning_rate=1e-3,
         tau=0.8,
         gamma=0.95,

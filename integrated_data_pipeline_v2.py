@@ -345,6 +345,113 @@ class IntegratedDataPipelineV2:
         
         return np.array(indices)
     
+    def get_stepwise_batch(self, batch_size: int = 256, split: str = 'train',
+                          vp2_bins: int = 10, seed: Optional[int] = None) -> Dict:
+        """
+        Get a batch of transitions with stepwise action information
+        
+        This function returns transitions with VP2 dose change information needed
+        for stepwise CQL training. For each transition, it includes:
+        - Current VP2 dose (continuous and discretized)
+        - Next VP2 dose (continuous and discretized) 
+        - VP2 change (discrete action representing the change)
+        
+        Args:
+            batch_size: Size of the batch
+            split: 'train', 'val', or 'test'
+            vp2_bins: Number of bins for discretizing VP2 doses (default 10)
+            seed: Optional seed for reproducibility
+            
+        Returns:
+            Dictionary with batch data including stepwise action information
+        """
+        if split == 'train':
+            data = self.train_data
+            patient_groups = self.train_patient_groups
+        elif split == 'val':
+            data = self.val_data
+            patient_groups = self.val_patient_groups
+        elif split == 'test':
+            data = self.test_data
+            patient_groups = self.test_patient_groups
+        else:
+            raise ValueError(f"Invalid split: {split}")
+        
+        if data is None:
+            raise ValueError("Data not prepared. Call prepare_data() first.")
+        
+        if self.model_type != 'dual':
+            raise ValueError("get_stepwise_batch requires model_type='dual'")
+        
+        # Use provided seed or internal RNG
+        rng = np.random.RandomState(seed) if seed is not None else self.rng
+        
+        # Sample indices (exclude last transition of each patient as it has no next action)
+        valid_indices = []
+        for patient_id, (start_idx, end_idx) in patient_groups.items():
+            # Exclude the last transition of each patient
+            if end_idx - start_idx > 1:
+                valid_indices.extend(range(start_idx, end_idx - 1))
+        
+        if len(valid_indices) < batch_size:
+            # Sample with replacement if not enough valid transitions
+            sampled_indices = rng.choice(valid_indices, size=batch_size, replace=True)
+        else:
+            sampled_indices = rng.choice(valid_indices, size=batch_size, replace=False)
+        
+        # Get base batch data
+        states = data['states'][sampled_indices]
+        actions = data['actions'][sampled_indices]  # [vp1, vp2_current]
+        rewards = data['rewards'][sampled_indices]
+        next_states = data['next_states'][sampled_indices]
+        dones = data['dones'][sampled_indices]
+        patient_ids = data['patient_ids'][sampled_indices]
+        
+        # Assert that actions are 2D (dual actions required for stepwise)
+        assert actions.ndim > 1, "Stepwise batch requires dual actions (VP1 and VP2)"
+        
+        # Extract VP2 doses (current and next)
+        vp1_actions = actions[:, 0]
+        vp2_current = actions[:, 1]
+        
+        # Get next VP2 doses (from next transition's action)
+        next_indices = sampled_indices + 1
+        next_actions = data['actions'][next_indices]
+        assert next_actions.ndim > 1, "Next actions must also be dual actions"
+        vp2_next = next_actions[:, 1]
+        
+        # Clip VP2 values to [0, 0.5] range for stepwise CQL
+        # Most therapeutic doses should be in this range
+        vp2_current = np.clip(vp2_current, 0, 0.5)
+        vp2_next = np.clip(vp2_next, 0, 0.5)
+        
+        # Discretize VP2 doses to bins
+        vp2_bin_edges = np.linspace(0, 0.5, vp2_bins + 1)
+        vp2_current_bins = np.digitize(vp2_current, vp2_bin_edges) - 1
+        vp2_current_bins = np.clip(vp2_current_bins, 0, vp2_bins - 1)
+        
+        vp2_next_bins = np.digitize(vp2_next, vp2_bin_edges) - 1
+        vp2_next_bins = np.clip(vp2_next_bins, 0, vp2_bins - 1)
+        
+        # Compute VP2 change as discrete action
+        # Map changes to discrete actions (e.g., -2, -1, 0, +1, +2 bins)
+        vp2_changes = vp2_next_bins - vp2_current_bins
+        
+        return {
+            'states': states,
+            'actions': actions,  # Original continuous actions [vp1, vp2]
+            'vp1_actions': vp1_actions,  # Binary VP1 actions
+            'vp2_current': vp2_current,  # Current VP2 dose (continuous)
+            'vp2_next': vp2_next,  # Next VP2 dose (continuous)
+            'vp2_current_bins': vp2_current_bins,  # Current VP2 bin index
+            'vp2_next_bins': vp2_next_bins,  # Next VP2 bin index
+            'vp2_changes': vp2_changes,  # VP2 change in bins (-2, -1, 0, +1, +2, etc.)
+            'rewards': rewards,
+            'next_states': next_states,
+            'dones': dones,
+            'patient_ids': patient_ids
+        }
+    
     def _print_summary(self):
         """Print summary of prepared data"""
         print("\n" + "="*60)
