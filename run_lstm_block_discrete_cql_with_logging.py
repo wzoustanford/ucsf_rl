@@ -18,6 +18,7 @@ from typing import Dict, Tuple
 from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 from medical_sequence_buffer import MedicalSequenceBuffer, SequenceDataLoader
 from lstm_block_discrete_cql_network import LSTMBlockDiscreteCQL
+from fqe_gaussian_analysis import FQEGaussianAnalysis, save_histogram_plot, save_q_values_to_pickle
 
 # Force unbuffered output
 sys.stdout = sys.__stdout__

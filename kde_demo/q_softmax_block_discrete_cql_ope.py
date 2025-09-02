@@ -243,20 +243,26 @@ class DataLoader:
         
         # Concatenate all data
         self.states = np.vstack(all_states)
-        self.actions_raw = np.concatenate(all_actions)  # Keep raw [VP1, VP2] format
+        self.actions_raw = np.concatenate(all_actions)  # Keep raw format
         
-        # Convert actions to combined index format for block discrete
-        # actions_raw[:, 0] is VP1 (binary)
-        # actions_raw[:, 1] is VP2 (continuous, needs discretization)
-        vp1_actions = self.actions_raw[:, 0].astype(int)  # Already binary
-        
-        # Discretize VP2 into bins
-        vp2_continuous = self.actions_raw[:, 1]
-        vp2_actions = np.digitize(vp2_continuous, self.vp2_bin_edges[1:])  # bins from 0 to vp2_bins-1
-        vp2_actions = np.clip(vp2_actions, 0, self.vp2_bins - 1)
-        
-        # Combine into single action index: action = vp1 * vp2_bins + vp2
-        self.actions = vp1_actions * self.vp2_bins + vp2_actions
+        # Handle different model types
+        if self.pipeline.model_type == 'binary':
+            # Binary model: actions are already 1D binary (0 or 1)
+            self.actions = self.actions_raw.astype(int)
+        else:
+            # Dual model: actions are 2D [VP1, VP2]
+            # Convert actions to combined index format for block discrete
+            # actions_raw[:, 0] is VP1 (binary)
+            # actions_raw[:, 1] is VP2 (continuous, needs discretization)
+            vp1_actions = self.actions_raw[:, 0].astype(int)  # Already binary
+            
+            # Discretize VP2 into bins
+            vp2_continuous = self.actions_raw[:, 1]
+            vp2_actions = np.digitize(vp2_continuous, self.vp2_bin_edges[1:])  # bins from 0 to vp2_bins-1
+            vp2_actions = np.clip(vp2_actions, 0, self.vp2_bins - 1)
+            
+            # Combine into single action index: action = vp1 * vp2_bins + vp2
+            self.actions = vp1_actions * self.vp2_bins + vp2_actions
         
         self.rewards = np.concatenate(all_rewards)
         self.patient_ids = np.concatenate(all_patient_ids)
@@ -952,8 +958,252 @@ def visualize_ope_results(results: Dict, save_path: Optional[str] = None):
 
 
 # ============================================================================
-# Main Evaluation Function
+# Binary CQL Agent (for comparison)
 # ============================================================================
+
+class BinaryCQLAgent:
+    """Binary action CQL agent (VP1 only)"""
+    
+    def __init__(self, state_dim: int, 
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+        self.state_dim = state_dim
+        self.action_dim = 1
+        self.device = device
+        
+        # Initialize Q-networks for continuous actions
+        self.q1 = ContinuousQNetwork(state_dim, 1).to(device)
+        self.q2 = ContinuousQNetwork(state_dim, 1).to(device)
+        
+    def load(self, path: str):
+        """Load model from checkpoint"""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.q1.load_state_dict(checkpoint['q1_state_dict'])
+        self.q2.load_state_dict(checkpoint['q2_state_dict'])
+        print(f"  Model loaded from {path}")
+        
+    def select_action(self, state: np.ndarray) -> float:
+        """Select binary action using Q-values"""
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            
+            # Evaluate Q-values for both actions
+            q_a0 = self.q1(state_tensor, torch.zeros(1, 1).to(self.device))
+            q_a1 = self.q1(state_tensor, torch.ones(1, 1).to(self.device))
+            
+            # Use Q2 as well for double Q-learning
+            q2_a0 = self.q2(state_tensor, torch.zeros(1, 1).to(self.device))
+            q2_a1 = self.q2(state_tensor, torch.ones(1, 1).to(self.device))
+            
+            # Take minimum for conservative estimate
+            q_a0 = torch.min(q_a0, q2_a0).item()
+            q_a1 = torch.min(q_a1, q2_a1).item()
+            
+            # Return action with higher Q-value
+            return 1.0 if q_a1 > q_a0 else 0.0
+    
+    def select_actions_batch(self, states: np.ndarray) -> np.ndarray:
+        """Select actions for a batch of states"""
+        with torch.no_grad():
+            states_tensor = torch.FloatTensor(states).to(self.device)
+            batch_size = states_tensor.shape[0]
+            
+            # Evaluate Q-values for both actions
+            zeros = torch.zeros(batch_size, 1).to(self.device)
+            ones = torch.ones(batch_size, 1).to(self.device)
+            
+            q1_a0 = self.q1(states_tensor, zeros)
+            q1_a1 = self.q1(states_tensor, ones)
+            q2_a0 = self.q2(states_tensor, zeros)
+            q2_a1 = self.q2(states_tensor, ones)
+            
+            # Take minimum for conservative estimate
+            q_a0 = torch.min(q1_a0, q2_a0).squeeze()
+            q_a1 = torch.min(q1_a1, q2_a1).squeeze()
+            
+            # Return actions with higher Q-values
+            actions = (q_a1 > q_a0).float().cpu().numpy()
+            
+            return actions
+
+
+class ContinuousQNetwork(nn.Module):
+    """Standard Q-network for continuous actions: Q(s,a) -> R"""
+    def __init__(self, state_dim: int, action_dim: int = 1, hidden_dim: int = 128):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 64)
+        self.fc4 = nn.Linear(64, 1)
+        
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        if action.dim() == 1:
+            action = action.unsqueeze(1)
+        x = torch.cat([state, action], dim=-1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        return self.fc4(x)
+
+
+# ============================================================================
+# Main Evaluation Functions
+# ============================================================================
+
+def evaluate_binary_cql(model_path: str, method: str = 'binary_kde',
+                       temperature: float = 1.0) -> Dict:
+    """
+    Evaluate a binary CQL model using importance sampling
+    
+    Args:
+        model_path: Path to saved model
+        method: 'binary_kde' or 'q_softmax'
+        temperature: Softmax temperature for q_softmax method
+        
+    Returns:
+        Dictionary with evaluation results
+    """
+    
+    print("=" * 60)
+    print("BINARY CQL OFF-POLICY EVALUATION")
+    print("=" * 60)
+    print(f"Model: {model_path}")
+    print(f"Method: {method}")
+    
+    # Load data - use 'binary' model type to get VP1 only
+    print("\n1. Loading data...")
+    data = DataLoader(model_type='binary', vp2_bins=1)  # vp2_bins not used for binary
+    
+    # Load model
+    print("\n2. Loading CQL model...")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    
+    agent = BinaryCQLAgent(state_dim=data.states.shape[1])
+    agent.load(model_path)
+    
+    # Split data
+    print("\n3. Splitting data...")
+    train_mask, test_mask = data.get_train_test_masks()
+    print(f"  Train+Val: {train_mask.sum()} samples")
+    print(f"  Test: {test_mask.sum()} samples")
+    
+    # Evaluate
+    print("\n4. Running OPE...")
+    evaluator = OPEEvaluator(method=method, vp2_bins=1, temperature=temperature)
+    
+    # For binary model, we need to handle the evaluation differently
+    # Generate learned policy actions
+    print("\n  Generating learned policy actions...")
+    batch_size = 10000
+    learned_actions = np.zeros(len(data.states), dtype=int)
+    
+    for i in range(0, len(data.states), batch_size):
+        end_idx = min(i + batch_size, len(data.states))
+        batch_states = data.states_scaled[i:end_idx]
+        batch_actions = agent.select_actions_batch(batch_states)
+        learned_actions[i:end_idx] = batch_actions.astype(int)
+        
+        if (i // batch_size) % 2 == 0:
+            print(f"    Processed {end_idx}/{len(data.states)} samples...")
+    
+    # Compute importance weights
+    print(f"\n  Computing importance weights using {method}...")
+    
+    # Subsample training data for KDE
+    max_kde_samples = 10000
+    train_indices = np.where(train_mask)[0]
+    if len(train_indices) > max_kde_samples:
+        np.random.seed(42)
+        train_indices = np.random.choice(train_indices, max_kde_samples, replace=False)
+        print(f"    Subsampling to {max_kde_samples} samples for KDE fitting")
+    
+    # Use BinaryKDEImportanceSampler
+    sampler = BinaryKDEImportanceSampler(bandwidth=0.1)
+    
+    # Fit KDEs
+    behavioral_kde = sampler.fit_policy(
+        data.states_scaled[train_indices],
+        data.actions[train_indices]
+    )
+    print("    Behavioral KDE fitted")
+    
+    target_kde = sampler.fit_policy(
+        data.states_scaled[train_indices],
+        learned_actions[train_indices]
+    )
+    print("    Target KDE fitted")
+    
+    # Compute importance weights on test set
+    weights = sampler.compute_importance_weights(
+        data.states_scaled[test_mask],
+        data.actions[test_mask],
+        behavioral_kde,
+        target_kde
+    )
+    
+    print(f"    Computed weights for {len(weights)} test samples")
+    
+    # Compute estimates
+    rewards_test = data.rewards[test_mask]
+    
+    # Importance Sampling
+    is_estimate = np.mean(weights * rewards_test)
+    
+    # Weighted Importance Sampling
+    wis_estimate = np.sum(weights * rewards_test) / np.sum(weights)
+    
+    # Effective Sample Size
+    ess = np.sum(weights) ** 2 / np.sum(weights ** 2)
+    
+    # Confidence intervals via bootstrap
+    n_bootstrap = 100
+    is_bootstrap = []
+    wis_bootstrap = []
+    
+    for _ in range(n_bootstrap):
+        idx = np.random.choice(len(rewards_test), len(rewards_test), replace=True)
+        w_b = weights[idx]
+        r_b = rewards_test[idx]
+        
+        is_bootstrap.append(np.mean(w_b * r_b))
+        wis_bootstrap.append(np.sum(w_b * r_b) / np.sum(w_b))
+    
+    results = {
+        'behavioral_reward': rewards_test.mean(),
+        'is_estimate': is_estimate,
+        'wis_estimate': wis_estimate,
+        'is_ci': (np.percentile(is_bootstrap, 2.5), np.percentile(is_bootstrap, 97.5)),
+        'wis_ci': (np.percentile(wis_bootstrap, 2.5), np.percentile(wis_bootstrap, 97.5)),
+        'ess': ess,
+        'ess_ratio': ess / len(rewards_test),
+        'weights': weights,
+        'weight_mean': weights.mean(),
+        'weight_std': weights.std(),
+        'weight_max': weights.max()
+    }
+    
+    # Print results
+    print("\n" + "=" * 60)
+    print("RESULTS")
+    print("=" * 60)
+    
+    print(f"\nBehavioral Policy:")
+    print(f"  Average Reward: {results['behavioral_reward']:.4f}")
+    
+    print(f"\nLearned Policy Estimates:")
+    print(f"  IS:  {results['is_estimate']:.4f} "
+          f"(95% CI: [{results['is_ci'][0]:.4f}, {results['is_ci'][1]:.4f}])")
+    print(f"  WIS: {results['wis_estimate']:.4f} "
+          f"(95% CI: [{results['wis_ci'][0]:.4f}, {results['wis_ci'][1]:.4f}])")
+    
+    print(f"\nImportance Weights:")
+    print(f"  Mean: {results['weight_mean']:.3f}")
+    print(f"  Std:  {results['weight_std']:.3f}")
+    print(f"  Max:  {results['weight_max']:.3f}")
+    print(f"  ESS:  {results['ess']:.1f} ({results['ess_ratio']*100:.1f}%)")
+    
+    return results
+
 
 def evaluate_block_discrete_cql(model_path: str, vp2_bins: int = 10, 
                                 method: str = 'block_kde', 

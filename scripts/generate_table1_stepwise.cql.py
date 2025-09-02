@@ -18,7 +18,7 @@ from run_unified_cql_allalphas import DualMixedCQL  # Changed from StableCQL
 from run_block_discrete_cql_allalphas import DualBlockDiscreteCQL
 from run_unified_stepwise_cql_allalphas import UnifiedStepwiseCQL, StepwiseActionSpace
 from vaso_init_policy import VasopressorInitiationPolicy, DualVasopressorInitiationPolicy
-
+from fqe_gaussian_analysis import FQEGaussianAnalysis, save_histogram_plot, save_q_values_to_pickle
 
 class StepwiseVasopressorPolicy:
     """
@@ -233,6 +233,9 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
     vp2_concordances = []  # For block discrete models only
     delta_q_timestep = []  # Delta Q per timestep
     delta_q_patient = []  # Delta Q per patient
+
+    all_model_q_values = []
+    all_clinician_q_values = []
     
     # Process each patient
     for patient_id, (start_idx, end_idx) in patient_groups.items():
@@ -376,6 +379,9 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
                     
                     # Check concordance
                     patient_vp2_concordance.append(model_vp2_bin == clinician_vp2_bin)
+
+            all_model_q_values.append(q_val)
+            all_clinician_q_values.append(q_clinician)
             
             patient_q_values.append(q_val)
             q_values_timestep.append(q_val)
@@ -389,6 +395,21 @@ def evaluate_model(model_type='binary', alpha=0.001, apply_persistence=False, vp
         if model_type in ['block_discrete', 'stepwise'] and patient_vp2_concordance:
             vp2_concordances.append(np.mean(patient_vp2_concordance))
     
+    file_str = f'q_values_model_{model_type}_alpha{alpha}_max_step{max_step}'
+    save_q_values_to_pickle(all_model_q_values, all_clinician_q_values, file_str + '.pkl')
+    save_histogram_plot(all_model_q_values, all_clinician_q_values, 
+                        filename=file_str + '.png', dpi=300, show_plot=False)
+    fqe_analyzer = FQEGaussianAnalysis(all_model_q_values, all_clinician_q_values)
+    # Save comprehensive 4-panel plot
+    fig = fqe_analyzer.save_analysis_plots(filename=file_str+'fqe_complete_analysis.png', show_plot=False)
+
+    # Save individual plots
+    fqe_analyzer.save_individual_plots(prefix=file_str+'_fqe', show_plots=False)
+    
+    # Get specific probability of improvement
+    prob_improvement = fqe_analyzer.compute_probability_improvement()
+    print(f"{file_str} Probability of model improvement over clinician mean: {prob_improvement:.3f}")
+
     # Calculate metrics
     results = {
         'vp1_usage': np.mean(vp1_usage) * 100,
@@ -415,13 +436,15 @@ def generate_latex_table(max_step):
     results = {}
     
     # Binary CQL with persistence (alpha=0.001 as baseline)
-    print(f"\nEvaluating Binary CQL (alpha=0.001)...")
-    results['binary'] = evaluate_model('binary', alpha=0.001, apply_persistence=True)
+    #print(f"\nEvaluating Binary CQL (alpha=0.001)...")
+    #results['binary'] = evaluate_model('binary', alpha=0.001, apply_persistence=True)
     
     # Stepwise CQL models - including all requested alphas
     print(f"\nEvaluating Stepwise CQL (alpha=0.000000)...")
     results['stepwise_0.000000'] = evaluate_model('stepwise', alpha=0.000000, apply_persistence=True, max_step=max_step)
+    print('finished evaluation, exiting from generate latex')
     
+    exit()
     print(f"\nEvaluating Stepwise CQL (alpha=0.000100)...")
     results['stepwise_0.000100'] = evaluate_model('stepwise', alpha=0.000100, apply_persistence=True, max_step=max_step)
     

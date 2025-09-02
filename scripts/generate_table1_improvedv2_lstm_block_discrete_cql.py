@@ -17,7 +17,7 @@ from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 from medical_sequence_buffer import MedicalSequenceBuffer, SequenceDataLoader
 from lstm_block_discrete_cql_network import LSTMBlockDiscreteCQL
 from vaso_init_policy import VasopressorInitiationPolicy, DualVasopressorInitiationPolicy
-
+from fqe_gaussian_analysis import FQEGaussianAnalysis, save_histogram_plot, save_q_values_to_pickle
 
 def evaluate_lstm_model(alpha=0.001, vp2_bins=5, sequence_length=5, burn_in_length=0, stride=1):
     """Evaluate an LSTM model on test set
@@ -94,6 +94,9 @@ def evaluate_lstm_model(alpha=0.001, vp2_bins=5, sequence_length=5, burn_in_leng
     vp2_concordances = []
     delta_q_timestep = []  # Delta Q per timestep
     delta_q_patient = []  # Delta Q per patient
+    
+    all_model_q_values = [] 
+    all_clinician_q_values = []
     
     # Process a subset of patients for faster evaluation
     patient_ids = list(pipeline.test_patient_groups.keys())
@@ -191,6 +194,8 @@ def evaluate_lstm_model(alpha=0.001, vp2_bins=5, sequence_length=5, burn_in_leng
                     q_values_timestep.append(q_optimal)
                     patient_delta_q.append(delta_q)
                     delta_q_timestep.append(delta_q)
+                    all_model_q_values.append(q_optimal)
+                    all_clinician_q_values.append(q_clinician)
         
         # ASSERTION: Ensure the last timestep (with mortality signal) was covered
         if patient_length >= sequence_length:
@@ -203,6 +208,21 @@ def evaluate_lstm_model(alpha=0.001, vp2_bins=5, sequence_length=5, burn_in_leng
             if patient_vp2_concordance:
                 vp2_concordances.append(np.mean(patient_vp2_concordance))
     
+    file_str = f'q_values_model_lsmt_BD_alpha{alpha}_bins{vp2_bins}'
+    save_q_values_to_pickle(all_model_q_values, all_clinician_q_values, file_str + '.pkl')
+    save_histogram_plot(all_model_q_values, all_clinician_q_values, 
+                        filename=file_str + '.png', dpi=300, show_plot=False)
+    fqe_analyzer = FQEGaussianAnalysis(all_model_q_values, all_clinician_q_values)
+    # Save comprehensive 4-panel plot
+    fig = fqe_analyzer.save_analysis_plots(filename=file_str+'fqe_complete_analysis.png', show_plot=False)
+
+    # Save individual plots
+    fqe_analyzer.save_individual_plots(prefix=file_str+'_fqe', show_plots=False)
+    
+    # Get specific probability of improvement
+    prob_improvement = fqe_analyzer.compute_probability_improvement()
+    print(f"{file_str} Probability of model improvement over clinician mean: {prob_improvement:.3f}")
+
     # Calculate metrics
     results = {
         'vp2_usage': np.mean(vp2_usage) * 100 if vp2_usage else 0.0,

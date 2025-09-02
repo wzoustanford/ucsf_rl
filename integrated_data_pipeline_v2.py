@@ -42,7 +42,7 @@ def compute_outcome_reward(
     mbp_idx = state_features.index('mbp') if 'mbp' in state_features else None
     lactate_idx = state_features.index('lactate') if 'lactate' in state_features else None
 
-    """    
+    """ 
     if mbp_idx is not None:
         mbp = state[mbp_idx]
         next_mbp = next_state[mbp_idx]
